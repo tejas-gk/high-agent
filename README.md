@@ -1,0 +1,65 @@
+# NBN Agent Control Room
+
+A structured Next.js + shadcn-style dashboard and Playwright agent for the CIMET hands-on NBN sign-up exercise.
+
+## Architecture
+
+`payload -> validation/normalisation -> job runner -> Playwright observe/act/verify -> L0/L1/L2/L3 healing -> isolated payment executor -> 3DS -> transaction ID -> report + leak scan`
+
+The model is **not** used for normal form filling. It is a bounded fallback for semantic re-grounding when deterministic locators stop working. Payment, OTP, CAPTCHA and final Pay Now are guarded and never free-form healed.
+
+## Run
+
+```bash
+npm install
+npx playwright install chromium
+cp .env.example .env.local
+npm run dev
+```
+
+Open `http://localhost:3000` and run the supplied sample payload. The app permits only `test-tangerine.hipeely.com` and one active job at a time.
+
+CLI single-command runner:
+
+```bash
+npm run agent -- payload.example.json
+```
+
+Mutation demo:
+
+```bash
+npm run agent -- payload.example.json --mutate
+```
+
+Leak check:
+
+```bash
+npm run leak-check
+```
+
+## AI healing
+
+L0: re-observe/wait/retry. L1: accessible role/name and visible-text fallback. L2: optional model call over a pruned list of at most 14 safe interactive candidates. L3 is represented by the agent's ability to reason from the current goal; unknown mandatory values must escalate instead of being invented. Configure an OpenAI-compatible chat-completions endpoint with `AI_API_KEY`, `AI_API_URL`, and `AI_MODEL`.
+
+## Payment boundary
+
+The job payload contains only `vault://test-cards/visa-success`. `src/vault.ts` resolves the public exercise test card just-in-time for one job. `src/payment.ts` is deterministic and never calls the model. PAN/CVV are cleared from the local card object after use, payment screenshots are not taken, and saved artifacts are scanned for the test PAN/CVV.
+
+The 3DS test branch selects `Authenticated (ECI 05)` only in the provided test environment. Unknown payment state is not automatically retried.
+
+## Mutation layer
+
+`src/mutation.ts` injects a browser-session-only mutation before page scripts run. It renames an ID, changes a safe non-payment label, moves the control in the DOM, and injects a dismissible popup. It does not modify Tangerine's server and does not mutate payment controls.
+
+## Interview demo
+
+1. Run clean journey.
+2. Show JSON report and transaction ID.
+3. Run with mutation enabled.
+4. Show healing event and independent postcondition.
+5. Run `npm run leak-check`.
+6. Keep a screen recording of the clean run as backup.
+
+## Important
+
+This project is intentionally locked to the provided test environment and public test data. Do not use real customer or card data.
