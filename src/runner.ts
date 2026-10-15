@@ -10,6 +10,8 @@ import type { JobPayload } from "./payload";
 import type { HealEvent, RunReport, TraceEvent } from "./types";
 import {
   assertCartPositive,
+  assertNbnPlanInCart,
+  chooseAddressSuggestion,
   checkAllVisible,
   clickAction,
   dismissDialogs,
@@ -139,29 +141,19 @@ export async function runAgent({
     done(2);
     log(2, "Address entered");
 
-    const suggestion = page
-      .locator('[role="option"], li, button')
-      .filter({ hasText: /ROCHESTER|MEADOW|6210/i })
-      .first();
-
-    if (await suggestion.count()) {
-      await clickAction(suggestion);
-    } else {
-      const manual = page
-        .locator("button, a, [role='button']")
-        .filter({
-          hasText:
-            /enter.*address.*manually|check your address manually|can't find your address/i,
-        })
-        .first();
-
-      if (
-        (await manual.count()) &&
-        (await manual.isVisible().catch(() => false))
-      ) {
-        await clickAction(manual);
-        await fillManual(page, payload);
+    const selected = await chooseAddressSuggestion(
+      page,
+      payload.connectionAddress.mainAddress.fullAddress,
+    );
+    if (!selected) {
+      const manual = page.locator("button, a, [role='button']").filter({
+        hasText: /enter.*address.*manually|check your address manually|can't find your address/i,
+      }).first();
+      if (!(await manual.isVisible().catch(() => false))) {
+        throw new Escalation("Address suggestion unavailable; manual address path not found");
       }
+      await clickAction(manual);
+      await fillManual(page, payload);
     }
 
     done(3);
@@ -179,18 +171,19 @@ export async function runAgent({
     done(4);
 
     await selectPlan(page, payload.plan.name);
+    await assertNbnPlanInCart(page, payload.plan.name);
     done(5);
     await dismissDialogs(page);
     done(6);
 
     if (payload.addOns.router.enabled) {
       await selectRouter(page, payload.addOns.router.model || "BYO Modem");
-      await assertCartPositive(page);
+      await assertNbnPlanInCart(page, payload.plan.name);
       done(7);
     }
 
+    await assertNbnPlanInCart(page, payload.plan.name);
     done(8);
-    await assertCartPositive(page);
 
     const order = await findAction(page, {
       step: 9,
