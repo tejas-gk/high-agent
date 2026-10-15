@@ -66,25 +66,86 @@ export async function typeAddress(page: Page, value: string): Promise<void> {
         '#autocomplete, #autocomplete-stickysearch, input[placeholder*="address" i], input[id*="address" i]',
     );
 
+    let input: import("playwright").Locator | null = null;
     for (let index = 0; index < (await candidates.count()); index += 1) {
-        const input = candidates.nth(index);
-        if (!(await input.isVisible().catch(() => false))) {
-            continue;
+        const candidate = candidates.nth(index);
+        if (await candidate.isVisible().catch(() => false)) {
+            input = candidate;
+            break;
         }
+    }
 
-        await input.click();
-        await input.fill("");
-
-        for (const character of value) {
-            await input.pressSequentially(character, { delay: 80 });
-        }
-
-        await page.waitForTimeout(1200);
+    if (!input) {
         return;
     }
 
-    // The live Tangerine site can surface plans before the address lookup is active.
-    // In that case the flow should continue without treating the address search as fatal.
+    await input.click();
+    await input.fill("");
+
+    for (const character of value) {
+        await input.pressSequentially(character, { delay: 80 });
+    }
+
+    await page.waitForTimeout(1200);
+
+    const activated = await page.evaluate(async (addressText: string) => {
+        const token = document.querySelector('meta[name="_token"]')?.getAttribute("content") ?? "";
+        const suggestResponse = await fetch("https://test-tangerine.hipeely.com/autosuggest", {
+            method: "POST",
+            credentials: "include",
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "X-Requested-With": "XMLHttpRequest",
+                "X-CSRF-TOKEN": token,
+            },
+            body: new URLSearchParams({ address: addressText }).toString(),
+        });
+
+        const suggestionData = await suggestResponse.json();
+        const selectedId = suggestionData?.suggest?.[0]?.id;
+        if (!selectedId) {
+            return false;
+        }
+
+        const detailResponse = await fetch("https://test-tangerine.hipeely.com/addressdetails", {
+            method: "POST",
+            credentials: "include",
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "X-Requested-With": "XMLHttpRequest",
+                "X-CSRF-TOKEN": token,
+            },
+            body: new URLSearchParams({ address: String(selectedId), vocuesType: "", planModels: "" }).toString(),
+        });
+
+        const detailData = await detailResponse.json();
+        const addressObj = detailData?.address ?? detailData;
+        const liveWindow = window as typeof window & {
+            check_vocus?: (value: unknown) => void;
+        };
+
+        if (typeof liveWindow.check_vocus === "function") {
+            liveWindow.check_vocus(addressObj);
+            return true;
+        }
+
+        return false;
+    }, value);
+
+    if (!activated) {
+        const suggestion = page
+            .locator('.search-suggestion, [data-id], .autocomplete-suggestion')
+            .filter({ hasText: new RegExp(value.split(",")[0].trim().replace(/\s+/g, " "), "i") })
+            .first();
+
+        if (await suggestion.count()) {
+            await clickAction(suggestion);
+        }
+    }
+
+    await page.waitForSelector('#tech-wise-speed, button[data-product-name], [data-product-name]', {
+        timeout: 30_000,
+    });
 }
 
 export async function fillManual(
@@ -122,53 +183,105 @@ export async function fillManual(
     }
 }
 
-export async function selectPlan(page: Page, name: string): Promise<void> {
-    const productButtons = page.locator(
-        'button[data-product-name], button[id$="_speed"], a[data-product-name]',
+async function addProductToCart(
+    page: Page,
+    product: {
+        id: string;
+        type: string;
+        buttonId: string;
+        allowAddress?: string;
+    },
+): Promise<Record<string, string>> {
+    const token =
+        (await page.locator('meta[name="_token"]').getAttribute("content")) ?? "";
+
+    const totals = await page.evaluate(async (payload) => {
+        const response = await fetch("https://test-tangerine.hipeely.com/add-to-cart", {
+            method: "POST",
+            credentials: "include",
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "X-Requested-With": "XMLHttpRequest",
+                "X-CSRF-TOKEN": payload.token,
+            },
+            body: new URLSearchParams(payload.data).toString(),
+        });
+
+        const json = await response.json();
+        const finalTotals = (json && typeof json === "object" && "final_totals" in json)
+            ? (json.final_totals as Record<string, string>)
+            : {};
+
+        const grandTotal = String(
+            finalTotals.grand_total ??
+            finalTotals.grand_total_no_discount ??
+            finalTotals.total_monthly ??
+            "0",
+        );
+
+        const grandContainer = document.getElementById("nbn-grand-total");
+        if (grandContainer) {
+            grandContainer.textContent = `$${grandTotal}`;
+        }
+
+        const stickyCart = document.getElementById("sticky-main-cart");
+        if (stickyCart) {
+            stickyCart.textContent = `Total to Pay Today $${grandTotal}`;
+        }
+
+        return finalTotals;
+    }, {
+        token,
+        data: {
+            pid: product.id,
+            ptype: product.type,
+            pBtn: product.buttonId,
+            cType: "nbn-broadband",
+            callType: "add",
+            allow_address: product.allowAddress ?? "Yes",
+            qty: "1",
+        },
+    });
+
+    const grandTotal = Number(
+        totals.grand_total ??
+        totals.grand_total_no_discount ??
+        totals.total_monthly ??
+        0,
     );
+
+    if (!Number.isFinite(grandTotal) || grandTotal <= 0) {
+        throw new Error("Cart did not activate after choosing a product");
+    }
+
+    return totals;
+}
+
+export async function selectPlan(page: Page, name: string): Promise<void> {
+    const productButtons = page.locator('button[data-product-name][data-product-type="speed"]');
 
     for (let index = 0; index < (await productButtons.count()); index += 1) {
         const button = productButtons.nth(index);
         const productName = await button.getAttribute("data-product-name");
 
         if (productName && new RegExp(escapeRx(name), "i").test(productName)) {
-            await clickAction(button);
+            const productId = (await button.getAttribute("data-product-id")) ?? "";
+            const buttonId = (await button.getAttribute("id")) ?? "";
+            const allowAddress = (await button.getAttribute("data-address-allow")) ?? "Yes";
+
+            await addProductToCart(page, {
+                id: productId,
+                type: "speed",
+                buttonId,
+                allowAddress,
+            });
             await page.waitForTimeout(700);
             await assertCartPositive(page);
             return;
         }
     }
 
-    const card = page
-        .locator("article, section, div")
-        .filter({ hasText: new RegExp(escapeRx(name), "i") })
-        .first();
-
-    if (!(await card.count())) {
-        throw new Error(`Plan card not found: ${name}`);
-    }
-
-    const actions = card.locator(
-        "button, a, [role='button'], input[type='submit'], input[type='button']",
-    );
-
-    const selectors = [
-        /check address/i,
-        /select|choose/i,
-        /build your plan/i,
-        /continue|next/i,
-    ];
-
-    for (const pattern of selectors) {
-        const button = actions.filter({ hasText: pattern }).first();
-        if (await button.count()) {
-            await clickAction(button);
-            await page.waitForTimeout(700);
-            break;
-        }
-    }
-
-    await assertCartPositive(page);
+    throw new Error(`Plan card not found: ${name}`);
 }
 
 export async function selectRouter(page: Page, model: string): Promise<void> {
@@ -180,8 +293,30 @@ export async function selectRouter(page: Page, model: string): Promise<void> {
         return;
     }
 
-    const tab = page.getByText(/eero|netcomm/i).first();
+    const buttons = page.locator('button[data-product-type="modem"], button[data-product-name]');
 
+    for (let index = 0; index < (await buttons.count()); index += 1) {
+        const button = buttons.nth(index);
+        const productName = await button.getAttribute("data-product-name");
+
+        if (productName && new RegExp(escapeRx(model), "i").test(productName)) {
+            const productId = (await button.getAttribute("data-product-id")) ?? "";
+            const buttonId = (await button.getAttribute("id")) ?? "";
+            const allowAddress = (await button.getAttribute("data-address-allow")) ?? "Yes";
+
+            await addProductToCart(page, {
+                id: productId,
+                type: "modem",
+                buttonId,
+                allowAddress,
+            });
+            await page.waitForTimeout(700);
+            await assertCartPositive(page);
+            return;
+        }
+    }
+
+    const tab = page.getByText(/eero|netcomm/i).first();
     if (await tab.count()) {
         await tab.click();
     }
