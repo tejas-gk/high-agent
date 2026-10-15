@@ -65,87 +65,38 @@ export async function typeAddress(page: Page, value: string): Promise<void> {
     const candidates = page.locator(
         '#autocomplete, #autocomplete-stickysearch, input[placeholder*="address" i], input[id*="address" i]',
     );
-
-    let input: import("playwright").Locator | null = null;
-    for (let index = 0; index < (await candidates.count()); index += 1) {
-        const candidate = candidates.nth(index);
-        if (await candidate.isVisible().catch(() => false)) {
-            input = candidate;
-            break;
-        }
-    }
-
-    if (!input) {
+    const count = await candidates.count();
+    for (let index = 0; index < count; index += 1) {
+        const input = candidates.nth(index);
+        if (!(await input.isVisible().catch(() => false))) continue;
+        await input.fill("");
+        await input.pressSequentially(value, { delay: 80 });
+        // The address must be selected from the actual UI; typing alone is not validation.
         return;
     }
+    throw new Error("Address search field not found");
+}
 
-    await input.click();
-    await input.fill("");
-
-    for (const character of value) {
-        await input.pressSequentially(character, { delay: 80 });
+export async function chooseAddressSuggestion(page: Page, address: string): Promise<boolean> {
+    const street = address.split(",")[0]?.trim() ?? address;
+    const suggestions = page.locator(
+        '[role="option"], .search-suggestion, .autocomplete-suggestion, [data-id]',
+    );
+    try {
+        await suggestions.first().waitFor({ state: "visible", timeout: 15000 });
+    } catch {
+        return false;
     }
-
-    await page.waitForTimeout(1200);
-
-    const activated = await page.evaluate(async (addressText: string) => {
-        const token = document.querySelector('meta[name="_token"]')?.getAttribute("content") ?? "";
-        const suggestResponse = await fetch("https://test-tangerine.hipeely.com/autosuggest", {
-            method: "POST",
-            credentials: "include",
-            headers: {
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "X-Requested-With": "XMLHttpRequest",
-                "X-CSRF-TOKEN": token,
-            },
-            body: new URLSearchParams({ address: addressText }).toString(),
-        });
-
-        const suggestionData = await suggestResponse.json();
-        const selectedId = suggestionData?.suggest?.[0]?.id;
-        if (!selectedId) {
-            return false;
-        }
-
-        const detailResponse = await fetch("https://test-tangerine.hipeely.com/addressdetails", {
-            method: "POST",
-            credentials: "include",
-            headers: {
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "X-Requested-With": "XMLHttpRequest",
-                "X-CSRF-TOKEN": token,
-            },
-            body: new URLSearchParams({ address: String(selectedId), vocuesType: "", planModels: "" }).toString(),
-        });
-
-        const detailData = await detailResponse.json();
-        const addressObj = detailData?.address ?? detailData;
-        const liveWindow = window as typeof window & {
-            check_vocus?: (value: unknown) => void;
-        };
-
-        if (typeof liveWindow.check_vocus === "function") {
-            liveWindow.check_vocus(addressObj);
+    for (let i = 0; i < await suggestions.count(); i += 1) {
+        const candidate = suggestions.nth(i);
+        if (!(await candidate.isVisible().catch(() => false))) continue;
+        const text = (await candidate.innerText().catch(() => "")).trim();
+        if (text.toLowerCase().includes(street.toLowerCase())) {
+            await clickAction(candidate);
             return true;
         }
-
-        return false;
-    }, value);
-
-    if (!activated) {
-        const suggestion = page
-            .locator('.search-suggestion, [data-id], .autocomplete-suggestion')
-            .filter({ hasText: new RegExp(value.split(",")[0].trim().replace(/\s+/g, " "), "i") })
-            .first();
-
-        if (await suggestion.count()) {
-            await clickAction(suggestion);
-        }
     }
-
-    await page.waitForSelector('#tech-wise-speed, button[data-product-name], [data-product-name]', {
-        timeout: 30_000,
-    });
+    return false;
 }
 
 export async function fillManual(
@@ -183,148 +134,67 @@ export async function fillManual(
     }
 }
 
-async function addProductToCart(
-    page: Page,
-    product: {
-        id: string;
-        type: string;
-        buttonId: string;
-        allowAddress?: string;
-    },
-): Promise<Record<string, string>> {
-    const token =
-        (await page.locator('meta[name="_token"]').getAttribute("content")) ?? "";
-
-    const totals = await page.evaluate(async (payload) => {
-        const response = await fetch("https://test-tangerine.hipeely.com/add-to-cart", {
-            method: "POST",
-            credentials: "include",
-            headers: {
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "X-Requested-With": "XMLHttpRequest",
-                "X-CSRF-TOKEN": payload.token,
-            },
-            body: new URLSearchParams(payload.data).toString(),
-        });
-
-        const json = await response.json();
-        const finalTotals = (json && typeof json === "object" && "final_totals" in json)
-            ? (json.final_totals as Record<string, string>)
-            : {};
-
-        const grandTotal = String(
-            finalTotals.grand_total ??
-            finalTotals.grand_total_no_discount ??
-            finalTotals.total_monthly ??
-            "0",
-        );
-
-        const grandContainer = document.getElementById("nbn-grand-total");
-        if (grandContainer) {
-            grandContainer.textContent = `$${grandTotal}`;
-        }
-
-        const stickyCart = document.getElementById("sticky-main-cart");
-        if (stickyCart) {
-            stickyCart.textContent = `Total to Pay Today $${grandTotal}`;
-        }
-
-        return finalTotals;
-    }, {
-        token,
-        data: {
-            pid: product.id,
-            ptype: product.type,
-            pBtn: product.buttonId,
-            cType: "nbn-broadband",
-            callType: "add",
-            allow_address: product.allowAddress ?? "Yes",
-            qty: "1",
-        },
-    });
-
-    const grandTotal = Number(
-        totals.grand_total ??
-        totals.grand_total_no_discount ??
-        totals.total_monthly ??
-        0,
-    );
-
-    if (!Number.isFinite(grandTotal) || grandTotal <= 0) {
-        throw new Error("Cart did not activate after choosing a product");
+/**
+ * Read actual cart state from the checkout UI. Never synthesize totals or
+ * invoke undocumented add-to-cart endpoints; those can desynchronise the session.
+ */
+export async function assertNbnPlanInCart(page: Page, name: string): Promise<void> {
+    const body = await page.locator("body").innerText();
+    if (/hold on[\\s\\S]{0,350}(?:router|modem)[\\s\\S]{0,200}(?:no nbn|without.*nbn|add.*nbn)/i.test(body)) {
+        throw new Error("Cart integrity alarm: router present without active plan");
     }
-
-    return totals;
+    const cart = page.locator(
+        '#sticky-main-cart, #nbn-grand-total, [class*="cart" i], [id*="cart" i], [class*="summary" i]',
+    );
+    let evidence = "";
+    for (let i = 0; i < Math.min(await cart.count(), 30); i += 1) {
+        const node = cart.nth(i);
+        if (await node.isVisible().catch(() => false)) {
+            evidence += " " + (await node.innerText().catch(() => ""));
+        }
+    }
+    if (!evidence.toLowerCase().includes(name.toLowerCase())) {
+        throw new Error(`NBN plan not confirmed in cart: ${name}`);
+    }
+    if (!/\\$\\s*[1-9]\\d*(?:\\.\\d{1,2})?/.test(evidence)) {
+        throw new Error("NBN cart has no verifiable positive price");
+    }
 }
 
 export async function selectPlan(page: Page, name: string): Promise<void> {
-    const productButtons = page.locator('button[data-product-name][data-product-type="speed"]');
-
-    for (let index = 0; index < (await productButtons.count()); index += 1) {
-        const button = productButtons.nth(index);
-        const productName = await button.getAttribute("data-product-name");
-
-        if (productName && new RegExp(escapeRx(name), "i").test(productName)) {
-            const productId = (await button.getAttribute("data-product-id")) ?? "";
-            const buttonId = (await button.getAttribute("id")) ?? "";
-            const allowAddress = (await button.getAttribute("data-address-allow")) ?? "Yes";
-
-            await addProductToCart(page, {
-                id: productId,
-                type: "speed",
-                buttonId,
-                allowAddress,
-            });
-            await page.waitForTimeout(700);
-            await assertCartPositive(page);
-            return;
+    const buttons = page.locator(
+        'button[data-product-name][data-product-type="speed"], button[data-product-name], button, a, [role="button"]',
+    );
+    let matched = false;
+    for (let i = 0; i < await buttons.count(); i += 1) {
+        const button = buttons.nth(i);
+        if (!(await button.isVisible().catch(() => false))) continue;
+        const productName = (await button.getAttribute("data-product-name")) ?? "";
+        const text = (await button.innerText().catch(() => "")) ?? "";
+        if (productName.toLowerCase().includes(name.toLowerCase()) ||
+            (text.toLowerCase().includes(name.toLowerCase()) && /select|choose|add|plan/i.test(text))) {
+            await clickAction(button);
+            matched = true;
+            break;
         }
     }
-
-    throw new Error(`Plan card not found: ${name}`);
+    if (!matched) throw new Error(`Plan card not found: ${name}`);
+    await page.waitForTimeout(1000);
+    await assertNbnPlanInCart(page, name);
 }
 
 export async function selectRouter(page: Page, model: string): Promise<void> {
     if (/byo/i.test(model)) {
         const option = page.getByText(/bring your own|byo modem/i).first();
-        if (await option.count()) {
-            await option.click();
-        }
+        if (!(await option.count())) throw new Error("BYO router option not found");
+        await clickAction(option);
         return;
     }
-
-    const buttons = page.locator('button[data-product-type="modem"], button[data-product-name]');
-
-    for (let index = 0; index < (await buttons.count()); index += 1) {
-        const button = buttons.nth(index);
-        const productName = await button.getAttribute("data-product-name");
-
-        if (productName && new RegExp(escapeRx(model), "i").test(productName)) {
-            const productId = (await button.getAttribute("data-product-id")) ?? "";
-            const buttonId = (await button.getAttribute("id")) ?? "";
-            const allowAddress = (await button.getAttribute("data-address-allow")) ?? "Yes";
-
-            await addProductToCart(page, {
-                id: productId,
-                type: "modem",
-                buttonId,
-                allowAddress,
-            });
-            await page.waitForTimeout(700);
-            await assertCartPositive(page);
-            return;
-        }
-    }
-
     const tab = page.getByText(/eero|netcomm/i).first();
-    if (await tab.count()) {
-        await tab.click();
-    }
-
+    if (await tab.count()) await clickAction(tab);
     const item = page.getByText(new RegExp(escapeRx(model), "i")).first();
-    if (await item.count()) {
-        await item.click();
-    }
+    if (!(await item.count())) throw new Error(`Router option not found: ${model}`);
+    await clickAction(item);
 }
 
 export async function assertCartPositive(page: Page): Promise<void> {
