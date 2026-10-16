@@ -13,19 +13,19 @@ async function visibleAction(page: Page, pattern: RegExp) {
   return null;
 }
 
-async function waitForPageChange(page: Page, before: string, timeoutMs = 10_000) {
+async function pageSignature(page: Page) {
+  return `${page.url()}|${(await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " ").slice(0, 1600)}`;
+}
+
+async function waitUntil(page: Page, predicate: () => Promise<boolean>, timeoutMs = 15_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const now = `${page.url()}|${(await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " ").slice(0, 1200)}`;
-    if (now !== before) return true;
+    if (await predicate().catch(() => false)) return true;
     await page.waitForTimeout(300);
   }
   return false;
 }
 
-/** Fill contact details and advance exactly one checkout step. Never repeatedly
- * click a generic Next button because Tangerine can keep the same URL across
- * several forms, which previously caused the runner to cycle/skip pages. */
 export async function fillContactAndAdvance(page: Page, payload: JobPayload): Promise<void> {
   const c = payload.customer;
   const title = page.locator("#salutation").filter({ visible: true }).first();
@@ -59,32 +59,76 @@ export async function fillContactAndAdvance(page: Page, payload: JobPayload): Pr
 
   const next = await visibleAction(page, /^(next|continue)\b/i);
   if (!next) throw new Error("Contact details Next control not found");
-  const before = `${page.url()}|${(await page.locator("body").innerText()).replace(/\s+/g, " ").slice(0, 1200)}`;
+  const before = await pageSignature(page);
   await clickAction(next);
-  if (!(await waitForPageChange(page, before))) throw new Error("Contact details Next did not advance; validation or portal state blocked progression");
+  if (!(await waitUntil(page, async () => (await pageSignature(page)) !== before, 10_000))) {
+    throw new Error("Contact details Next did not advance; validation or portal state blocked progression");
+  }
 }
 
-/** Step 15. The donation page shown by Tangerine has a plain orange Next button.
- * Decline when a No option exists, click one visible Next, and verify the page
- * actually changes before payment logic is allowed to start. */
-export async function declineDonationAndAdvance(page: Page): Promise<void> {
-  const body = await page.locator("body").innerText().catch(() => "");
-  if (!/donat|small change big change|give more back/i.test(body)) return;
+function donationPage(text: string) {
+  return /would you like to add a \$?1 donation|small change big change|\bdonation\b/i.test(text);
+}
+
+async function chooseDonationNo(page: Page): Promise<boolean> {
+  // Prefer the semantic label because the portal can use opaque radio values.
+  const labelledNo = page.getByLabel(/^no$/i).filter({ visible: true }).first();
+  if (await labelledNo.count()) {
+    await labelledNo.check({ force: true }).catch(() => undefined);
+    if (await labelledNo.isChecked().catch(() => false)) return true;
+  }
+
+  const labels = page.locator("label:visible");
+  for (let i = 0; i < (await labels.count()); i += 1) {
+    const label = labels.nth(i);
+    const text = (await label.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+    if (!/^no\b/i.test(text)) continue;
+    await label.click({ force: true }).catch(() => undefined);
+    return true;
+  }
 
   const radios = page.locator('input[type="radio"]:visible');
   for (let i = 0; i < (await radios.count()); i += 1) {
     const radio = radios.nth(i);
-    const value = `${await radio.getAttribute("value").catch(() => "")} ${await radio.getAttribute("id").catch(() => "")}`;
+    const value = `${await radio.getAttribute("value").catch(() => "")} ${await radio.getAttribute("id").catch(() => "")} ${await radio.getAttribute("name").catch(() => "")}`;
     if (/\bno\b|decline|false|0/i.test(value)) {
       await radio.check({ force: true }).catch(() => undefined);
-      break;
+      if (await radio.isChecked().catch(() => false)) return true;
     }
   }
+  return false;
+}
 
-  const next = await visibleAction(page, /^(next|continue)\b/i);
-  if (!next) throw new Error("Donation page Next control not found");
-  const before = `${page.url()}|${body.replace(/\s+/g, " ").slice(0, 1200)}`;
-  await next.scrollIntoViewIfNeeded().catch(() => undefined);
-  await clickAction(next);
-  if (!(await waitForPageChange(page, before, 15_000))) throw new Error("Donation Next did not advance to payment/summary");
+/** Step 15: decline the optional donation and do not return until the donation
+ * screen has genuinely disappeared. A small validation/selection repaint is not
+ * sufficient evidence that checkout advanced. */
+export async function declineDonationAndAdvance(page: Page): Promise<void> {
+  let body = await page.locator("body").innerText().catch(() => "");
+  if (!donationPage(body)) return;
+
+  if (!(await chooseDonationNo(page))) {
+    throw new Error("Donation page detected but the No option could not be selected");
+  }
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const next = await visibleAction(page, /^(next|continue)\b/i);
+    if (!next) throw new Error("Donation page Next control not found");
+    await next.scrollIntoViewIfNeeded().catch(() => undefined);
+    await clickAction(next);
+
+    const leftDonation = await waitUntil(page, async () => {
+      const current = await page.locator("body").innerText().catch(() => "");
+      return !donationPage(current);
+    }, 8_000);
+    if (leftDonation) return;
+
+    // The first click may only surface client-side validation. Reassert No and
+    // retry the same guarded step, but never pretend Step 15 completed while the
+    // donation question remains visible.
+    await chooseDonationNo(page);
+    await page.waitForTimeout(300);
+    body = await page.locator("body").innerText().catch(() => body);
+  }
+
+  throw new Error(`Donation Next did not leave donation page: ${body.replace(/\s+/g, " ").slice(0, 500)}`);
 }
