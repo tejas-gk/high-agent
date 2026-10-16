@@ -1,9 +1,20 @@
 export type RunStatus =
   | "queued"
   | "running"
+  | "waiting_for_human"
   | "success"
   | "failed"
   | "escalated";
+
+export type HumanRequestType = "EMAIL_OTP" | "CAPTCHA" | "THREE_DS";
+
+export type HumanRequest = {
+  type: HumanRequestType;
+  step: number;
+  message: string;
+  requestedAt: string;
+};
+
 export type TraceEvent = {
   at: string;
   level: "info" | "warn" | "error";
@@ -41,6 +52,7 @@ export type JobView = {
   createdAt: string;
   updatedAt: string;
   trace: TraceEvent[];
+  humanRequest?: HumanRequest;
   report?: RunReport;
   error?: string;
 };

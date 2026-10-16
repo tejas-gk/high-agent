@@ -7,10 +7,9 @@ import { executePayment } from "./payment";
 import { installMutationLayer } from "./mutation";
 import { leakScan } from "./security";
 import type { JobPayload } from "./payload";
-import type { HealEvent, RunReport, TraceEvent } from "./types";
+import type { HealEvent, HumanRequestType, RunReport, TraceEvent } from "./types";
 import {
   activePopupId,
-  assertNbnPlanInCart,
   checkAllVisible,
   chooseAddressSuggestion,
   clickAction,
@@ -30,7 +29,6 @@ import {
   typeAddress,
   verifyOrderSummary,
   waitForAddressResult,
-  waitForPlanInCart,
 } from "./runner-helpers";
 
 export type RunnerOptions = {
@@ -38,6 +36,11 @@ export type RunnerOptions = {
   payload: JobPayload;
   mutate: boolean;
   emit: (event: TraceEvent) => void;
+  requestHumanInput?: (request: {
+    type: HumanRequestType;
+    step: number;
+    message: string;
+  }) => Promise<string>;
 };
 
 export async function runAgent({
@@ -45,6 +48,7 @@ export async function runAgent({
   payload,
   mutate,
   emit,
+  requestHumanInput,
 }: RunnerOptions): Promise<RunReport> {
   const started = Date.now();
   const completed: number[] = [];
@@ -108,9 +112,7 @@ export async function runAgent({
   };
 
   const done = (step: number) => {
-    if (!completed.includes(step)) {
-      completed.push(step);
-    }
+    if (!completed.includes(step)) completed.push(step);
   };
 
   const makeReport = (
@@ -175,8 +177,6 @@ export async function runAgent({
         await fillManual(page, payload);
       }
 
-      // The portal runs an address check behind a "Hold tight!" spinner and then
-      // raises a result modal. Wait for it, then confirm the tech type.
       await waitForAddressResult(page);
       const techResult = await resolvePopup(
         page,
@@ -188,10 +188,6 @@ export async function runAgent({
       await settlePopups(page);
       done(4);
 
-      // Select the plan and optional router, then go straight to checkout.
-      // selectPlan/selectRouter already confirm the sticky cart has a positive
-      // total; re-verifying here adds delay that can let the BYO modem
-      // add-to-cart race and poison the cart, causing a /checkout bounce.
       await selectPlan(page, payload.plan.name);
       await settlePopups(page);
 
@@ -202,9 +198,7 @@ export async function runAgent({
 
       done(5);
       done(6);
-      if (payload.addOns.router.enabled) {
-        done(7);
-      }
+      if (payload.addOns.router.enabled) done(7);
       done(8);
 
       await clickOrderNow(page);
@@ -215,10 +209,10 @@ export async function runAgent({
       return onCheckout;
     };
 
-    const runOrder = async (): Promise<"ok" | "checkoutBounce" | "otpBlocked"> => {
-      if (!(await selectAndOrder())) {
-        return "checkoutBounce";
-      }
+    let transactionId: string | undefined;
+
+    const runOrder = async (): Promise<"ok" | "checkoutBounce"> => {
+      if (!(await selectAndOrder())) return "checkoutBounce";
 
       const email = page
         .locator('#email, input[type="email"], input[name*="email" i]')
@@ -239,17 +233,12 @@ export async function runAgent({
       }
       await clickAction(emailNext);
 
-      // The portal may either navigate straight to the contact page (test
-      // environment auto-verifies) or raise a one-time-pin screen that requires
-      // human entry. Wait for navigation before treating OTP as a hard block.
       let navigated = false;
       const emailDeadline = Date.now() + 12_000;
       while (Date.now() < emailDeadline && !navigated) {
         if (
           !/checkout\/login/i.test(page.url()) ||
-          (await page
-            .locator("#fname, input[name='fname' i], #salutation")
-            .count())
+          (await page.locator("#fname, input[name='fname' i], #salutation").count())
         ) {
           navigated = true;
           break;
@@ -257,18 +246,48 @@ export async function runAgent({
         await page.waitForTimeout(400);
       }
 
-const stillOnLogin = /checkout\/login/i.test(page.url());
-    const otpField = page.locator(
-      'input[autocomplete="one-time-code"], input[name*="otp" i], input[id*="otp" i], input[name*="verification" i]',
-    );
-    if (stillOnLogin && (await otpField.count())) {
-      // OTP screen appeared - note it but continue; the test environment
-      // auto-verifies in some cases, and we proceed to the contact page.
-      // If OTP is truly required, it will be handled in the payment phase.
-      log(11, "OTP appeared on login page; proceeding regardless");
-    }
+      const stillOnLogin = /checkout\/login/i.test(page.url());
+      const otpField = page
+        .locator(
+          'input[autocomplete="one-time-code"], input[name*="otp" i], input[id*="otp" i], input[name*="verification" i]',
+        )
+        .filter({ visible: true })
+        .first();
 
-    done(11);
+      if (stillOnLogin && (await otpField.count())) {
+        if (!requestHumanInput) {
+          throw new Escalation("Email OTP requires human submission");
+        }
+
+        log(11, "Human handoff: waiting for email OTP; browser session preserved");
+        const otp = await requestHumanInput({
+          type: "EMAIL_OTP",
+          step: 11,
+          message: "Enter the email verification code to resume the same browser session.",
+        });
+
+        await otpField.fill(otp);
+        const submitOtp = page
+          .locator("button, input[type='submit'], input[type='button']")
+          .filter({ hasText: /verify|submit|continue|next/i })
+          .filter({ visible: true })
+          .first();
+        if (!(await submitOtp.count())) {
+          throw new Escalation("OTP submit control not found after human handoff");
+        }
+
+        await clickAction(submitOtp);
+        await page.waitForTimeout(800);
+
+        const otpStillVisible = await otpField.isVisible().catch(() => false);
+        if (otpStillVisible && /checkout\/login/i.test(page.url())) {
+          throw new Escalation("OTP was not accepted; refusing to guess or retry automatically");
+        }
+
+        log(11, "Human handoff complete; resumed same browser session");
+      }
+
+      done(11);
 
       await fillContact(page, payload);
       done(12);
@@ -284,10 +303,7 @@ const stillOnLogin = /checkout\/login/i.test(page.url());
           .getByLabel(/^no$/i)
           .first()
           .or(page.locator('input[type="radio"][value="no" i]').first());
-
-        if (await no.count()) {
-          await no.check();
-        }
+        if (await no.count()) await no.check();
 
         const next = await findAction(page, {
           step: 15,
@@ -307,15 +323,13 @@ const stillOnLogin = /checkout\/login/i.test(page.url());
       }));
       log(15, "Before order summary", beforeSummary);
       await verifyOrderSummary(page, payload);
+
       const payResult = await executePayment(page, {
         jobId,
         cardRef: payload.payment.cardRef,
         nameOnCard: payload.payment.nameOnCard,
       });
-
-      log(16, "Payment fields filled by isolated executor", {
-        last4: payResult.last4,
-      });
+      log(16, "Payment fields filled by isolated executor", { last4: payResult.last4 });
       await checkAllVisible(page);
 
       const pay = page
@@ -323,9 +337,7 @@ const stillOnLogin = /checkout\/login/i.test(page.url());
         .filter({ hasText: /pay now/i })
         .first();
       if (!(await pay.count())) {
-        throw new Escalation(
-          "Final Pay Now control missing; guarded step will not heal",
-        );
+        throw new Escalation("Final Pay Now control missing; guarded step will not heal");
       }
 
       await clickAction(pay);
@@ -334,7 +346,6 @@ const stillOnLogin = /checkout\/login/i.test(page.url());
       const modal = page.getByRole("dialog").first();
       if (await modal.count()) {
         const checks = modal.locator('input[type="checkbox"]');
-
         for (let index = 0; index < (await checks.count()); index += 1) {
           await checks.nth(index).check();
         }
@@ -344,16 +355,12 @@ const stillOnLogin = /checkout\/login/i.test(page.url());
           .filter({ hasText: /pay now/i })
           .first();
         if (!(await modalPay.count())) {
-          throw new Escalation(
-            "Confirmation Pay Now missing; guarded step will not heal",
-          );
+          throw new Escalation("Confirmation Pay Now missing; guarded step will not heal");
         }
-
         await clickAction(modalPay);
       }
 
       done(17);
-
       transactionId = await handle3dsAndTransaction(page);
       done(18);
       done(19);
@@ -372,55 +379,29 @@ const stillOnLogin = /checkout\/login/i.test(page.url());
       return "ok";
     };
 
-    // OTP at step 11 is human-only per the PDF; checkout bounces happen when the
-    // server session commits late. Retry the whole order with a clean session
-    // until either gremlin does not appear or we run out of attempts.
-    let orderStatus: "ok" | "checkoutBounce" | "otpBlocked" = "checkoutBounce";
-    let transactionId: string | undefined;
-    for (
-      let attempt = 1;
-      attempt <= 6 && (orderStatus === "checkoutBounce" || orderStatus === "otpBlocked");
-      attempt += 1
-    ) {
+    let orderStatus: "ok" | "checkoutBounce" = "checkoutBounce";
+    for (let attempt = 1; attempt <= 6 && orderStatus === "checkoutBounce"; attempt += 1) {
       if (attempt > 1) {
         await resetSession();
-        // The test portal can be slow to respond; retry the navigation a couple
-        // of times before treating the whole attempt as lost.
         let navigated = false;
         for (let navAttempt = 1; navAttempt <= 3 && !navigated; navAttempt += 1) {
-            try {
-                await page.goto(payload.portal.url, {
-                    waitUntil: "domcontentloaded",
-                    timeout: 30_000,
-                });
-                navigated = true;
-            } catch {
-                await page.waitForTimeout(2000);
-            }
+          try {
+            await page.goto(payload.portal.url, {
+              waitUntil: "domcontentloaded",
+              timeout: 30_000,
+            });
+            navigated = true;
+          } catch {
+            await page.waitForTimeout(2000);
+          }
         }
-        if (!navigated) {
-            continue;
-        }
+        if (!navigated) continue;
         await page.waitForTimeout(4000);
       }
 
-      try {
-        orderStatus = await runOrder();
-      } catch (error) {
-        if (error instanceof Escalation) {
-          orderStatus = "otpBlocked";
-          continue;
-        }
-        throw error;
-      }
-
+      orderStatus = await runOrder();
       if (orderStatus === "checkoutBounce") {
-        log(9, `Checkout bounce on attempt ${attempt}; retrying`, {
-          url: page.url(),
-        });
-      }
-      if (orderStatus === "otpBlocked") {
-        log(11, `Email OTP on attempt ${attempt}; retrying`);
+        log(9, `Checkout bounce on attempt ${attempt}; retrying`, { url: page.url() });
       }
     }
 
@@ -428,17 +409,9 @@ const stillOnLogin = /checkout\/login/i.test(page.url());
       throw new Error("Order Now did not reach checkout after retries");
     }
 
-    if (orderStatus === "otpBlocked") {
-      throw new Escalation(
-        "Email OTP appeared on every retry; requires human submission",
-      );
-    }
-
-
     const report = makeReport("success", transactionId);
     await writeReport(report);
     await leakScan(evidenceDir);
-
     return report;
   } catch (error) {
     const escalated = error instanceof Escalation;
