@@ -29,34 +29,57 @@ export async function recoverUnexpectedPage(page: Page, args: { step: number; go
   if (args.expected && (await page.locator(args.expected).filter({ visible: true }).count())) return true;
   const observation = await observe(page);
   const pageText = `${observation.title} ${observation.headings.join(" ")} ${observation.bodyText}`;
-  // reCAPTCHA v3 commonly leaves a harmless badge/anchor iframe on every page.
-  // Only challenge/bframe URLs or explicit challenge text count as a human handoff.
+
   const captchaChallengeFrame = page.frames().some((frame) => /recaptcha.*(bframe|challenge)|hcaptcha.*(challenge|checkbox)/i.test(frame.url()));
   if (/verify you are human|i am not a robot|captcha challenge/i.test(pageText) || captchaChallengeFrame) throw new Error("HUMAN_REQUIRED:CAPTCHA");
   if (/one[- ]time|verification code|enter.*otp|email.*code/i.test(pageText)) throw new Error("HUMAN_REQUIRED:EMAIL_OTP");
   if (/card number|cvv|pay now|payment details/i.test(pageText)) throw new Error("Guarded payment state encountered during free-form recovery");
+  if (args.modelBudget.used >= args.modelBudget.max) throw new Error("Model-call budget exhausted");
 
   const visibleInputs = observation.candidates.filter((candidate) => ["input", "select", "textarea"].includes(candidate.tag) && candidate.type !== "hidden");
-  if (visibleInputs.length > 0) throw new Error("Unexpected required form needs a payload-backed value; escalating instead of inventing data");
-  if (args.modelBudget.used >= args.modelBudget.max) throw new Error("Model-call budget exhausted");
   const safeActions = observation.candidates.filter((candidate) => (candidate.tag === "button" || candidate.tag === "a" || candidate.role === "button") && !/pay|purchase|submit order|place order|otp|verify code|captcha/i.test(`${candidate.text} ${candidate.name}`));
-  if (!safeActions.length) return false;
-  const choice = await chooseCandidate({ intent: `${args.goal}. This is an unexpected interstitial or reordered page. Choose only a safe navigation/dismiss action that moves toward the goal; do not answer a new customer preference.`, observation, candidates: safeActions });
-  args.modelBudget.used++;
-  if (!choice || choice.confidence < 0.75) return false;
-  const selected = safeActions.find((candidate) => candidate.id === choice.candidateId);
-  if (!selected) return false;
-  const before = `${page.url()}|${observation.headings.join("|")}|${observation.bodyText.slice(0, 300)}`;
-  const interactive = page.locator("button:visible,a:visible,input:visible,select:visible,textarea:visible,[role=button]:visible,[role=radio]:visible,[role=checkbox]:visible").nth(choice.candidateId - 1);
-  await interactive.scrollIntoViewIfNeeded().catch(() => undefined);
-  await interactive.click({ timeout: 10_000 }).catch(async () => { await interactive.evaluate((element: HTMLElement) => element.click()); });
-  await page.waitForTimeout(700);
-  const afterObservation = await observe(page);
-  const after = `${page.url()}|${afterObservation.headings.join("|")}|${afterObservation.bodyText.slice(0, 300)}`;
-  const reachedExpected = args.expected ? (await page.locator(args.expected).filter({ visible: true }).count()) > 0 : false;
-  const changed = before !== after;
-  args.heals.push({ step: args.step, level: "L3", intent: args.goal, reason: choice.reason, newLocator: `candidate:${choice.candidateId}`, confidence: choice.confidence, evidence: JSON.stringify(selected), verified: reachedExpected || changed });
-  return reachedExpected || changed;
+
+  // Do not fail merely because an unfamiliar page contains inputs. First let
+  // the LLM reason about the page and any safe navigation/dismiss action. This
+  // is what makes reordered pages, renamed markup and harmless interstitials
+  // agentic rather than selector-bound. It still cannot invent customer data.
+  if (safeActions.length) {
+    const choice = await chooseCandidate({
+      intent: `${args.goal}. The current page may have changed structure, tags, ids, classes, labels, layout or step order. Infer the page semantically. Choose only a safe navigation/dismiss action that advances the existing payload-backed journey. Do not invent or choose a value for a new customer preference.`,
+      observation,
+      candidates: safeActions,
+    });
+    args.modelBudget.used++;
+    if (choice && choice.confidence >= 0.75) {
+      const selected = safeActions.find((candidate) => candidate.id === choice.candidateId);
+      if (selected) {
+        const before = `${page.url()}|${observation.headings.join("|")}|${observation.bodyText.slice(0, 300)}`;
+        const allInteractive = page.locator("button:visible,a:visible,input:visible,select:visible,textarea:visible,[role=button]:visible,[role=radio]:visible,[role=checkbox]:visible");
+        const candidateIds = observation.candidates.map((c) => c.id);
+        const domIndex = candidateIds.indexOf(selected.id);
+        if (domIndex >= 0) {
+          const interactive = allInteractive.nth(domIndex);
+          await interactive.scrollIntoViewIfNeeded().catch(() => undefined);
+          await interactive.click({ timeout: 10_000 }).catch(async () => { await interactive.evaluate((element: HTMLElement) => element.click()); });
+          await page.waitForTimeout(700);
+          const afterObservation = await observe(page);
+          const after = `${page.url()}|${afterObservation.headings.join("|")}|${afterObservation.bodyText.slice(0, 300)}`;
+          const reachedExpected = args.expected ? (await page.locator(args.expected).filter({ visible: true }).count()) > 0 : false;
+          const changed = before !== after;
+          args.heals.push({ step: args.step, level: "L3", intent: args.goal, reason: choice.reason, newLocator: `candidate:${choice.candidateId}`, confidence: choice.confidence, evidence: JSON.stringify(selected), verified: reachedExpected || changed });
+          if (reachedExpected || changed) return true;
+        }
+      }
+    }
+  } else {
+    // Count the reasoning attempt only when a model call was actually possible.
+    args.modelBudget.used++;
+  }
+
+  if (visibleInputs.length > 0) {
+    throw new Error("Unexpected form could not be safely advanced without inventing data; LLM inspected the state and escalation is required");
+  }
+  return false;
 }
 
 function escapeRx(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
