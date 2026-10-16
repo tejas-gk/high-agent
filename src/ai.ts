@@ -100,7 +100,10 @@ export type PayloadFieldKey =
   | "connection.currentProvider"
   | "connection.avcId"
   | "connection.moveInDate"
-  | "connection.deliveryDate";
+  | "connection.deliveryDate"
+  | "connection.activation"
+  | "policy.unsure"
+  | "policy.otherProvider";
 
 export type AiFormPlan = {
   assignments: Array<{ candidateId: number; valueKey: PayloadFieldKey }>;
@@ -125,6 +128,7 @@ export async function planPayloadForm(args: {
     "address.streetName","address.streetType","address.suburb","address.state",
     "address.postcode","address.unitNumber","connection.currentProvider",
     "connection.avcId","connection.moveInDate","connection.deliveryDate",
+    "connection.activation","policy.unsure","policy.otherProvider",
   ];
   const candidates = args.candidates.slice(0, 40);
   const response = await fetch(url, {
