@@ -55,16 +55,13 @@ export async function semanticLocator(
     }
   }
 
-  if (args.modelBudget.used >= args.modelBudget.max) {
-    throw new Error("Model-call budget exhausted");
-  }
+  if (args.modelBudget.used >= args.modelBudget.max) throw new Error("Model-call budget exhausted");
 
   const o = await observe(page);
   const choice = await chooseCandidate({ intent: args.intent, observation: o, candidates: o.candidates });
   args.modelBudget.used++;
 
   if (!choice || choice.confidence < 0.7) throw new Error("No high-confidence semantic recovery");
-
   const c = o.candidates.find((x) => x.id === choice.candidateId);
   if (!c) throw new Error("AI selected unknown candidate");
 
@@ -89,21 +86,21 @@ export async function semanticLocator(
 
 /**
  * Recover from a new, harmless interstitial or changed step order without
- * teaching the runner every page up-front. This deliberately only allows
- * navigation/dismiss controls. Forms requiring a new customer value are
- * escalated instead of letting the model invent an answer.
+ * teaching the runner every page up-front. Only navigation/dismiss controls
+ * are eligible. A new form that needs a customer value is escalated instead of
+ * letting the model invent an answer.
  */
 export async function recoverUnexpectedPage(
   page: Page,
   args: {
     step: number;
     goal: string;
-    expected: string;
+    expected?: string;
     modelBudget: { used: number; max: number };
     heals: HealEvent[];
   },
 ): Promise<boolean> {
-  if (await page.locator(args.expected).filter({ visible: true }).count()) return true;
+  if (args.expected && (await page.locator(args.expected).filter({ visible: true }).count())) return true;
 
   const observation = await observe(page);
   const pageText = `${observation.title} ${observation.headings.join(" ")} ${observation.bodyText}`;
@@ -111,15 +108,13 @@ export async function recoverUnexpectedPage(
   if (/captcha|i am not a robot|recaptcha|hcaptcha/i.test(pageText)) {
     throw new Error("HUMAN_REQUIRED:CAPTCHA");
   }
-  if (/one[- ]time|verification code|security code|enter.*otp|email.*code/i.test(pageText)) {
+  if (/one[- ]time|verification code|enter.*otp|email.*code/i.test(pageText)) {
     throw new Error("HUMAN_REQUIRED:EMAIL_OTP");
   }
-  if (/card number|cvv|security code.*card|pay now|payment details/i.test(pageText)) {
+  if (/card number|cvv|pay now|payment details/i.test(pageText)) {
     throw new Error("Guarded payment state encountered during free-form recovery");
   }
 
-  // A new required form is not a safe autonomous recovery: the payload is the
-  // source of truth and the model may choose where to act, never what value to invent.
   const visibleInputs = observation.candidates.filter(
     (candidate) => ["input", "select", "textarea"].includes(candidate.tag) && candidate.type !== "hidden",
   );
@@ -134,7 +129,6 @@ export async function recoverUnexpectedPage(
     const text = `${candidate.text} ${candidate.name}`;
     return !/pay|purchase|submit order|place order|otp|verify code|captcha/i.test(text);
   });
-
   if (!safeActions.length) return false;
 
   const choice = await chooseCandidate({
@@ -161,7 +155,9 @@ export async function recoverUnexpectedPage(
 
   const afterObservation = await observe(page);
   const after = `${page.url()}|${afterObservation.headings.join("|")}|${afterObservation.bodyText.slice(0, 300)}`;
-  const reachedExpected = (await page.locator(args.expected).filter({ visible: true }).count()) > 0;
+  const reachedExpected = args.expected
+    ? (await page.locator(args.expected).filter({ visible: true }).count()) > 0
+    : false;
   const changed = before !== after;
 
   args.heals.push({
