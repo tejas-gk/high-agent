@@ -103,6 +103,54 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
     throw new Escalation(`Could not safely reach expected state: ${goal}`);
   };
 
+
+  const bodyMatches = async (pattern: RegExp) =>
+    pattern.test((await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " "));
+
+  const completeStepWithRecovery = async (
+    step: number,
+    goal: string,
+    deterministic: () => Promise<void>,
+    stillOnStep: RegExp,
+  ) => {
+    let deterministicError: unknown;
+    try {
+      await deterministic();
+      await page.waitForTimeout(500);
+      if (!(await bodyMatches(stillOnStep))) return;
+    } catch (error) {
+      deterministicError = error;
+    }
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const recovered = await recoverUnexpectedPage(page, {
+          step, goal, payload, modelBudget, heals,
+        });
+        if (recovered) {
+          await page.waitForTimeout(500);
+          if (!(await bodyMatches(stillOnStep))) {
+            log(step, "AI recovered the changed checkout step and verified progression");
+            return;
+          }
+        }
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        if (reason === "HUMAN_REQUIRED:CAPTCHA") {
+          await humanCaptcha(step);
+          continue;
+        }
+        if (reason === "HUMAN_REQUIRED:EMAIL_OTP") {
+          throw new Escalation("Email OTP appeared during checkout recovery");
+        }
+        throw new Escalation(reason);
+      }
+    }
+
+    const base = deterministicError instanceof Error ? deterministicError.message : String(deterministicError ?? "");
+    throw new Escalation(`Could not safely complete ${goal}${base ? `: ${base}` : ""}`);
+  };
+
   try {
     await page.goto(payload.portal.url, { waitUntil: "domcontentloaded", timeout: 60_000 });
     if (!page.url().includes("test-tangerine.hipeely.com")) throw new Error("Portal URL did not match approved test environment");
@@ -168,10 +216,29 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
       }
       done(9); done(10); done(11);
 
-      await ensureExpectedState(12, "Reach the contact details form", "#fname, input[name='fname' i], #salutation");
-      await fillContactAndAdvance(page, payload); done(12); log(12, "Contact details submitted; verified page advanced");
-      await fillService(page, payload); done(13); log(13, "Service/delivery step submitted");
-      await fillConnection(page, payload); done(14); log(14, "Connection details submitted");
+      await completeStepWithRecovery(
+        12,
+        "Complete the contact details form using only payload-backed customer values",
+        () => fillContactAndAdvance(page, payload),
+        /first name|last name|date of birth|hear about us|privacy policy/i,
+      );
+      done(12); log(12, "Contact details submitted; progression verified");
+
+      await completeStepWithRecovery(
+        13,
+        "Complete the service and delivery address step using only the supplied address",
+        () => fillService(page, payload),
+        /service address|delivery address|self care portal/i,
+      );
+      done(13); log(13, "Service/delivery step submitted; progression verified");
+
+      await completeStepWithRecovery(
+        14,
+        "Complete connection activation/transfer details from the payload and assignment-safe defaults",
+        () => fillConnection(page, payload),
+        /process order|current provider|avc|new connection|transfer connection/i,
+      );
+      done(14); log(14, "Connection details submitted; progression verified");
 
       await declineDonationAndAdvance(page);
       done(15); log(15, "Donation step cleared; validating checkout summary");
