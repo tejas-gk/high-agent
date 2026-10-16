@@ -463,7 +463,32 @@ export async function waitForAddressResult(
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
         const id = await activePopupId(page);
-        if (id && id !== "modal-loader") return id;
+        if (id && id !== "modal-loader") {
+            const section = page.locator(`#user-model #${id}`).first();
+            const text = await section.innerText().catch(() => "");
+            if (/address not found|unable to (?:find|locate)|couldn.?t find.*address/i.test(text)) {
+                throw new Escalation("Address Not Found");
+            }
+            if (/nearly there/i.test(text)) {
+                const radios = section.locator('input[type="radio"]:visible');
+                if (await radios.count()) await radios.first().check({ force: true }).catch(() => undefined);
+                const select = section.locator("select:visible").first();
+                if (await select.count()) {
+                    const options = await select.locator("option").evaluateAll((els) =>
+                        els.map((el) => ({ value: (el as HTMLOptionElement).value, text: (el.textContent || "").trim() }))
+                    ).catch(() => [] as Array<{ value: string; text: string }>);
+                    const usable = options.find((x) => x.value && !/select|choose/i.test(x.text));
+                    if (usable) await select.selectOption(usable.value).catch(() => undefined);
+                }
+                const next = section.locator("button,a,[role='button']").filter({ hasText: /continue|confirm|next/i }).filter({ visible: true }).first();
+                if (await next.count()) {
+                    await clickAction(next);
+                    await page.waitForTimeout(700);
+                    continue;
+                }
+            }
+            return id;
+        }
         await page.waitForTimeout(500);
     }
     return null;
