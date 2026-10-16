@@ -5,12 +5,13 @@ import { recoverUnexpectedPage } from "./healing";
 import { executePayment } from "./payment";
 import { installMutationLayer } from "./mutation";
 import { leakScan } from "./security";
+import { declineDonationAndAdvance, fillContactAndAdvance } from "./checkout-progress";
 import type { JobPayload } from "./payload";
 import type { HealEvent, HumanRequestType, RunReport, TraceEvent } from "./types";
 import {
   activePopupId, checkAllVisible, chooseAddressSuggestion, clickAction, clickOrderNow,
-  Escalation, fillConnection, fillContact, fillManual, fillService, fillVerified,
-  findAction, handle3dsAndTransaction, resolvePopup, selectPlan, selectRouter,
+  Escalation, fillConnection, fillManual, fillService, fillVerified,
+  handle3dsAndTransaction, resolvePopup, selectPlan, selectRouter,
   settlePopups, typeAddress, verifyOrderSummary, waitForAddressResult,
 } from "./runner-helpers";
 
@@ -32,8 +33,6 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
   let sensitiveMode = false;
   await fs.mkdir(evidenceDir, { recursive: true });
 
-  // Local interview/demo runs are headed by default so a human can solve CAPTCHA.
-  // Set HEADLESS=true explicitly for environments where no guarded challenge is expected.
   const browser = await chromium.launch({ headless: process.env.HEADLESS === "true" });
   const context = await browser.newContext();
   let page = await context.newPage();
@@ -73,8 +72,7 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
     log(step, "Human handoff: CAPTCHA requires manual completion; browser session preserved");
     await capturePreview();
     await requestHumanInput({
-      type: "CAPTCHA",
-      step,
+      type: "CAPTCHA", step,
       message: "A CAPTCHA is blocking the signup. Solve it in the opened Tangerine browser window, then return here and click ‘I solved the CAPTCHA — continue’. Do not close the browser.",
     });
     await page.waitForTimeout(500);
@@ -142,12 +140,9 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
       if (!(await emailNext.count())) throw new Escalation("Checkout Next control not found");
       await clickAction(emailNext);
 
-      // CAPTCHA can be injected by the portal after the email submit. It is guarded:
-      // human solves it in the headed browser, then the same session resumes.
       await page.waitForTimeout(1000);
       if (await captchaPresent()) {
         await humanCaptcha(11);
-        // Some CAPTCHA integrations require the original submit once more after solving.
         if (/checkout\/login/i.test(page.url()) && await emailNext.isVisible().catch(() => false)) await clickAction(emailNext);
       }
 
@@ -174,20 +169,15 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
       done(11);
 
       await ensureExpectedState(12, "Reach the contact details form", "#fname, input[name='fname' i], #salutation");
-      await fillContact(page, payload); done(12);
-      await fillService(page, payload); done(13);
-      await fillConnection(page, payload); done(14);
+      await fillContactAndAdvance(page, payload); done(12); log(12, "Contact details submitted; verified page advanced");
+      await fillService(page, payload); done(13); log(13, "Service/delivery step submitted");
+      await fillConnection(page, payload); done(14); log(14, "Connection details submitted");
 
-      if (await page.getByText(/donat/i).count()) {
-        const no = page.getByLabel(/^no$/i).first().or(page.locator('input[type="radio"][value="no" i]').first());
-        if (await no.count()) await no.check();
-        const next = await findAction(page, { step: 15, intent: "Decline donation and continue to payment", names: ["Next", "Continue"], modelBudget, heals });
-        await clickAction(next);
-      }
-      done(15);
+      await declineDonationAndAdvance(page);
+      done(15); log(15, "Donation step cleared; validating checkout summary");
 
-      log(15, "Reached order summary; validating plan, price and address before payment");
       await verifyOrderSummary(page, payload);
+      log(15, "Order summary verified; entering guarded payment boundary");
       sensitiveMode = true;
       const payResult = await executePayment(page, { jobId, cardRef: payload.payment.cardRef, nameOnCard: payload.payment.nameOnCard });
       log(16, "Payment fields filled by isolated executor", { last4: payResult.last4 });
