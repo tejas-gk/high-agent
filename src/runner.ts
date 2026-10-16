@@ -27,7 +27,7 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
   const started = Date.now();
   const completed: number[] = [];
   const heals: HealEvent[] = [];
-  const modelBudget = { used: 0, max: 6 };
+  const modelBudget = { used: 0, max: 10 };
   const evidenceDir = path.resolve("artifacts", jobId);
   const previewPath = path.join(evidenceDir, "live.png");
   let sensitiveMode = false;
@@ -59,259 +59,276 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
     durationMs: Date.now() - started, modelCalls: modelBudget.used, failureReason, evidenceDir,
   });
   const writeReport = (report: RunReport) => fs.writeFile(path.join(evidenceDir, "report.json"), JSON.stringify(report, null, 2));
+  const bodyText = async () => (await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " ");
+  const bodyMatches = async (pattern: RegExp) => pattern.test(await bodyText());
 
   const captchaPresent = async () => {
     const challengeFrame = page.frames().some((frame) => /recaptcha.*(bframe|challenge)|hcaptcha/i.test(frame.url()));
     if (challengeFrame) return true;
-    const text = await page.locator("body").innerText().catch(() => "");
-    return /verify you are human|i am not a robot|captcha challenge/i.test(text);
+    return /verify you are human|i am not a robot|captcha challenge/i.test(await bodyText());
   };
 
   const humanCaptcha = async (step: number) => {
     if (!requestHumanInput) throw new Escalation("CAPTCHA requires human completion");
     log(step, "Human handoff: CAPTCHA requires manual completion; browser session preserved");
-    await capturePreview();
     await requestHumanInput({
       type: "CAPTCHA", step,
-      message: "A CAPTCHA is blocking the signup. Solve it in the opened Tangerine browser window, then return here and click ‘I solved the CAPTCHA — continue’. Do not close the browser.",
+      message: "A CAPTCHA is blocking the signup. Solve it in the opened Tangerine browser window, then return here and continue. Do not close the browser.",
     });
     await page.waitForTimeout(500);
     if (await captchaPresent()) throw new Escalation("CAPTCHA is still active after human handoff");
-    log(step, "CAPTCHA cleared by human; agent resumed the same browser session");
+    log(step, "CAPTCHA cleared by human; resumed same browser session");
   };
-
 
   const humanResolveEscalation = async (step: number, reason: string) => {
     if (!requestHumanInput) throw new Escalation(reason);
     log(step, "Human handoff: recoverable escalation; browser session preserved", { reason });
     await capturePreview();
     await requestHumanInput({
-      type: "MANUAL_ESCALATION",
-      step,
-      message: `The agent could not safely continue automatically: ${reason}. Resolve the issue directly in the open Tangerine browser without closing it, then click “I resolved it — continue”. The agent will re-observe the same session and continue from the current page.`,
+      type: "MANUAL_ESCALATION", step,
+      message: `The agent could not safely continue automatically: ${reason}. Resolve the issue in the open Tangerine browser without closing it, then click “I resolved it — continue”. The agent will re-observe this same session.`,
     });
     await page.waitForTimeout(500);
-    log(step, "Manual escalation marked resolved; re-observing current browser state");
+    log(step, "Manual escalation returned; re-observing current browser state");
   };
 
-  const ensureExpectedState = async (step: number, goal: string, selector: string) => {
-    if (await page.locator(selector).filter({ visible: true }).count()) return;
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+  /**
+   * One recovery gate for every non-sensitive pre-payment step.
+   * Deterministic Playwright runs first. If it throws or its postcondition is
+   * false, L2/L3 semantic recovery gets a chance before human handoff.
+   */
+  const runRecoverable = async (args: {
+    step: number;
+    goal: string;
+    deterministic: () => Promise<void>;
+    verified: () => Promise<boolean>;
+    attempts?: number;
+  }) => {
+    let firstError = "postcondition not reached";
+    try {
+      await args.deterministic();
+      await page.waitForTimeout(400);
+      if (await args.verified()) return;
+    } catch (error) {
+      firstError = error instanceof Error ? error.message : String(error);
+      log(args.step, "Deterministic action failed; invoking semantic recovery", { reason: firstError });
+    }
+
+    for (let attempt = 1; attempt <= (args.attempts ?? 2); attempt += 1) {
       try {
-        const recovered = await recoverUnexpectedPage(page, { step, goal, expected: selector, payload, modelBudget, heals });
-        if (recovered && (await page.locator(selector).filter({ visible: true }).count())) {
-          log(step, "AI re-planned around an unexpected page and verified recovery");
+        const recovered = await recoverUnexpectedPage(page, {
+          step: args.step, goal: args.goal, payload, modelBudget, heals,
+        });
+        await page.waitForTimeout(500);
+        if (recovered && await args.verified()) {
+          log(args.step, "Semantic recovery succeeded and postcondition verified", { attempt });
           return;
         }
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         if (reason === "HUMAN_REQUIRED:CAPTCHA") {
-          await humanCaptcha(step);
-          if (await page.locator(selector).filter({ visible: true }).count()) return;
-          continue;
-        }
-        if (reason === "HUMAN_REQUIRED:EMAIL_OTP") throw new Escalation("Email OTP appeared outside the guarded checkout handoff");
-        await humanResolveEscalation(step, reason);
-        if (await page.locator(selector).filter({ visible: true }).count()) return;
-        continue;
-      }
-    }
-    throw new Escalation(`Could not safely reach expected state: ${goal}`);
-  };
-
-
-  const bodyMatches = async (pattern: RegExp) =>
-    pattern.test((await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " "));
-
-  const completeStepWithRecovery = async (
-    step: number,
-    goal: string,
-    deterministic: () => Promise<void>,
-    expectedNext: RegExp,
-  ) => {
-    const reachedNext = async () => bodyMatches(expectedNext);
-    let deterministicError: unknown;
-
-    try {
-      await deterministic();
-      await page.waitForTimeout(500);
-      if (await reachedNext()) return;
-    } catch (error) {
-      deterministicError = error;
-    }
-
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      try {
-        const recovered = await recoverUnexpectedPage(page, {
-          step, goal, payload, modelBudget, heals,
-        });
-        if (recovered) {
-          await page.waitForTimeout(500);
-          if (await reachedNext()) {
-            log(step, "AI recovered the changed checkout step and verified the expected next state");
-            return;
-          }
-        }
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        if (reason === "HUMAN_REQUIRED:CAPTCHA") {
-          await humanCaptcha(step);
-          if (await reachedNext()) return;
+          await humanCaptcha(args.step);
+          if (await args.verified()) return;
           continue;
         }
         if (reason === "HUMAN_REQUIRED:EMAIL_OTP") {
-          throw new Escalation("Email OTP appeared during checkout recovery");
+          throw new Escalation("Email OTP requires guarded human handoff");
         }
-
-        await humanResolveEscalation(step, reason);
-        if (await reachedNext()) {
-          log(step, "Human resolved escalation; expected next state verified");
-          return;
-        }
-
-        log(step, "Human handoff returned but expected next state was not reached; recovery will continue");
+        firstError = reason;
+        log(args.step, "Semantic recovery could not verify progression", { reason, attempt });
       }
     }
 
-    const base = deterministicError instanceof Error ? deterministicError.message : String(deterministicError ?? "");
-    const reason = `Could not safely complete ${goal}${base ? `: ${base}` : ""}`;
-    await humanResolveEscalation(step, reason);
-    if (await reachedNext()) {
-      log(step, "Human resolved final escalation; expected next state verified");
+    await humanResolveEscalation(args.step, firstError);
+    if (await args.verified()) {
+      log(args.step, "Human recovery verified; continuing same run");
       return;
     }
-    throw new Escalation(`${reason}. The browser is still not on the expected next checkout state.`);
+
+    // One final semantic observation after the human has changed the page. This
+    // is important when the human only dismisses the blocker rather than doing
+    // the whole step manually.
+    try {
+      const recovered = await recoverUnexpectedPage(page, {
+        step: args.step, goal: args.goal, payload, modelBudget, heals,
+      });
+      await page.waitForTimeout(500);
+      if (recovered && await args.verified()) return;
+    } catch (error) {
+      firstError = error instanceof Error ? error.message : String(error);
+    }
+    throw new Escalation(`${args.goal} could not be verified after AI and human recovery: ${firstError}`);
   };
+
+  const checkoutReached = async () =>
+    /checkout|login/i.test(page.url()) ||
+    (await page.locator('#email, input[type="email"], input[name*="email" i]').filter({ visible: true }).count()) > 0;
 
   try {
     await page.goto(payload.portal.url, { waitUntil: "domcontentloaded", timeout: 60_000 });
     if (!page.url().includes("test-tangerine.hipeely.com")) throw new Error("Portal URL did not match approved test environment");
-    done(1); log(1, "Portal opened");
+    done(1); log(1, "Portal opened and approved origin verified");
 
     const selectAndOrder = async (): Promise<boolean> => {
-      await typeAddress(page, payload.connectionAddress.mainAddress.fullAddress); done(2); log(2, "Address entered");
-      const selected = await chooseAddressSuggestion(page, payload.connectionAddress.mainAddress.fullAddress);
-      if (!selected) {
-        const manual = page.locator("button, a, [role='button']").filter({ hasText: /enter.*address.*manually|check your address manually|can't find your address/i }).first();
-        if (!(await manual.isVisible().catch(() => false))) throw new Escalation("Address suggestion unavailable; manual address path not found");
-        await clickAction(manual); await fillManual(page, payload);
-      }
-      await waitForAddressResult(page);
-      const techResult = await resolvePopup(page, /build your plan|see nbn|see other plans|continue with nbn|pre-?order/i);
-      done(3); log(3, "Address confirmed", { techResult });
-      await settlePopups(page); done(4);
-      await selectPlan(page, payload.plan.name); await settlePopups(page);
-      done(5); done(6);
-      if (payload.addOns.router.enabled) {
-        await selectRouter(page, payload.addOns.router.model || "BYO Modem");
-        await settlePopups(page);
-        done(7);
-        try {
-          await assertNbnPlanInCart(page, payload.plan.name);
-        } catch {
-          log(8, "Router selection reset the cart; re-selecting the requested plan");
-          await selectPlan(page, payload.plan.name);
-          await settlePopups(page);
-          await assertNbnPlanInCart(page, payload.plan.name);
-        }
-      } else {
-        await assertNbnPlanInCart(page, payload.plan.name);
-      }
-      done(8);
+      await runRecoverable({
+        step: 2,
+        goal: `Enter the supplied service address and expose an address suggestion or manual-address path`,
+        deterministic: () => typeAddress(page, payload.connectionAddress.mainAddress.fullAddress),
+        verified: async () => {
+          const suggestion = page.locator(".autocomplete-suggestion:visible");
+          const manual = page.locator("button:visible,a:visible,[role='button']:visible").filter({ hasText: /manual|can't find|cannot find/i });
+          return (await suggestion.count()) > 0 || (await manual.count()) > 0;
+        },
+      });
+      done(2); log(2, "Service address entered and address path verified");
 
-      let checkoutReached = false;
-      for (let orderAttempt = 1; orderAttempt <= 3 && !checkoutReached; orderAttempt += 1) {
-        await clickOrderNow(page);
-        checkoutReached = /checkout|login/i.test(page.url());
-        if (!checkoutReached) {
-          const body = await page.locator("body").innerText().catch(() => "");
-          if (/hold\s*on/i.test(body) && /modem|router|plan/i.test(body)) {
-            throw new Escalation("Cart integrity alarm: modem/router present without a valid NBN plan");
+      await runRecoverable({
+        step: 3,
+        goal: `Confirm the supplied service address and reach the NBN technology/plan result`,
+        deterministic: async () => {
+          const selected = await chooseAddressSuggestion(page, payload.connectionAddress.mainAddress.fullAddress);
+          if (!selected) {
+            const manual = page.locator("button, a, [role='button']").filter({ hasText: /enter.*address.*manually|check your address manually|can't find your address/i }).filter({ visible: true }).first();
+            if (!(await manual.count())) throw new Error("Address suggestion unavailable and manual path not found");
+            await clickAction(manual);
+            await fillManual(page, payload);
           }
-          await page.waitForTimeout(700);
-        }
+          await waitForAddressResult(page);
+          await resolvePopup(page, /build your plan|see nbn|see other plans|continue with nbn|pre-?order/i);
+          await settlePopups(page);
+        },
+        verified: async () => /speed|plan|nbn|build your plan/i.test(await bodyText()),
+      });
+      done(3); done(4); log(4, "Address confirmed and plan builder reached");
+
+      await runRecoverable({
+        step: 5,
+        goal: `Select exactly the requested NBN plan “${payload.plan.name}” and keep a positive cart`,
+        deterministic: async () => { await selectPlan(page, payload.plan.name); await settlePopups(page); },
+        verified: async () => { try { await assertNbnPlanInCart(page, payload.plan.name); return true; } catch { return false; } },
+      });
+      done(5); done(6); log(6, "Requested NBN plan selected; blocking dialogs cleared");
+
+      if (payload.addOns.router.enabled) {
+        await runRecoverable({
+          step: 7,
+          goal: `Select the requested router option “${payload.addOns.router.model || "BYO Modem"}” without losing the NBN plan`,
+          deterministic: async () => { await selectRouter(page, payload.addOns.router.model || "BYO Modem"); await settlePopups(page); },
+          verified: async () => { try { await assertNbnPlanInCart(page, payload.plan.name); return true; } catch { return false; } },
+        });
+        done(7); log(7, "Router choice completed");
       }
-      const popupId = await activePopupId(page);
-      const onCheckout = /checkout|login/i.test(page.url());
-      log(9, "Order Now clicked", { url: page.url(), popupId, onCheckout });
-      return onCheckout;
+
+      try {
+        await assertNbnPlanInCart(page, payload.plan.name);
+      } catch {
+        log(8, "Cart lost the requested plan; restoring it before checkout");
+        await runRecoverable({
+          step: 8,
+          goal: `Restore and verify the requested NBN plan “${payload.plan.name}” in a positive cart`,
+          deterministic: async () => { await selectPlan(page, payload.plan.name); await settlePopups(page); },
+          verified: async () => { try { await assertNbnPlanInCart(page, payload.plan.name); return true; } catch { return false; } },
+        });
+      }
+      done(8); log(8, "Order cart positively verified");
+
+      await runRecoverable({
+        step: 9,
+        goal: "Proceed from the already-verified NBN cart into checkout. Find the semantic equivalent of Order Now/Checkout even if its tag, id, class, label, or position changed.",
+        deterministic: async () => {
+          for (let attempt = 0; attempt < 3 && !(await checkoutReached()); attempt += 1) {
+            await clickOrderNow(page);
+            await page.waitForTimeout(700);
+            const body = await bodyText();
+            if (/hold\s*on/i.test(body) && /modem|router|plan/i.test(body)) throw new Escalation("Cart integrity alarm: modem/router present without a valid NBN plan");
+          }
+        },
+        verified: checkoutReached,
+        attempts: 3,
+      });
+      done(9); done(10); log(10, "Checkout reached and cart-integrity guard passed", { url: page.url(), popupId: await activePopupId(page) });
+      return true;
     };
 
     let transactionId: string | undefined;
     const runOrder = async (): Promise<"ok" | "checkoutBounce"> => {
       if (!(await selectAndOrder())) return "checkoutBounce";
-      const email = page.locator('#email, input[type="email"], input[name*="email" i]').filter({ visible: true }).first();
-      if (!(await email.count())) throw new Escalation("Checkout email field not found");
-      await fillVerified(page, email, payload.customer.email);
-      const emailNext = page.locator("button, a, input[type='submit'], input[type='button']").filter({ hasText: /next/i }).filter({ visible: true }).first();
-      if (!(await emailNext.count())) throw new Escalation("Checkout Next control not found");
-      await clickAction(emailNext);
 
-      await page.waitForTimeout(1000);
-      const loginBody = await page.locator("body").innerText().catch(() => "");
+      await runRecoverable({
+        step: 11,
+        goal: "Enter the payload email on checkout login and advance to contact details or guarded OTP/CAPTCHA",
+        deterministic: async () => {
+          const email = page.locator('#email, input[type="email"], input[name*="email" i]').filter({ visible: true }).first();
+          if (!(await email.count())) throw new Error("Checkout email field not found");
+          await fillVerified(page, email, payload.customer.email);
+          const next = page.locator("button:visible,a:visible,input[type='submit']:visible,input[type='button']:visible").filter({ hasText: /next|continue/i }).first();
+          if (!(await next.count())) throw new Error("Checkout Next control not found");
+          await clickAction(next);
+          await page.waitForTimeout(900);
+        },
+        verified: async () => {
+          if (await captchaPresent()) return true;
+          const otp = page.locator('input[autocomplete="one-time-code"], input[name*="otp" i], input[id*="otp" i], input[name*="verification" i]').filter({ visible: true });
+          if (await otp.count()) return true;
+          return (await page.locator("#fname, input[name='fname' i], #salutation").filter({ visible: true }).count()) > 0 || /contact details/i.test(await bodyText());
+        },
+      });
+
+      const loginBody = await bodyText();
       if (/no plan|plan.*missing|select.*plan|choose.*plan/i.test(loginBody) && /checkout|order/i.test(loginBody)) {
         throw new Escalation("Checkout reported a missing NBN plan; refusing to continue with an invalid cart");
       }
-      if (await captchaPresent()) {
-        await humanCaptcha(11);
-        if (/checkout\/login/i.test(page.url()) && await emailNext.isVisible().catch(() => false)) await clickAction(emailNext);
-      }
+      if (await captchaPresent()) await humanCaptcha(11);
 
-      let navigated = false;
-      const emailDeadline = Date.now() + 12_000;
-      while (Date.now() < emailDeadline && !navigated) {
-        if (!/checkout\/login/i.test(page.url()) || (await page.locator("#fname, input[name='fname' i], #salutation").count())) { navigated = true; break; }
-        await page.waitForTimeout(400);
-      }
-
-      const stillOnLogin = /checkout\/login/i.test(page.url());
       const otpField = page.locator('input[autocomplete="one-time-code"], input[name*="otp" i], input[id*="otp" i], input[name*="verification" i]').filter({ visible: true }).first();
-      if (stillOnLogin && (await otpField.count())) {
+      if (await otpField.count()) {
         if (!requestHumanInput) throw new Escalation("Email OTP requires human submission");
         log(11, "Human handoff: waiting for email OTP; browser session preserved");
-        const otp = await requestHumanInput({ type: "EMAIL_OTP", step: 11, message: "Check the verification email and enter the one-time code here. The agent will submit it and continue in the same browser session." });
+        const otp = await requestHumanInput({ type: "EMAIL_OTP", step: 11, message: "Enter the one-time email verification code. It goes directly to Playwright and is not sent to Sarvam." });
         await otpField.fill(otp);
-        const submitOtp = page.locator("button, input[type='submit'], input[type='button']").filter({ hasText: /verify|submit|continue|next/i }).filter({ visible: true }).first();
+        const submitOtp = page.locator("button:visible,input[type='submit']:visible,input[type='button']:visible").filter({ hasText: /verify|submit|continue|next/i }).first();
         if (!(await submitOtp.count())) throw new Escalation("OTP submit control not found after human handoff");
-        await clickAction(submitOtp); await page.waitForTimeout(800);
-        if (await otpField.isVisible().catch(() => false) && /checkout\/login/i.test(page.url())) throw new Escalation("OTP was not accepted; refusing to guess or retry automatically");
-        log(11, "Email verification complete; resumed same browser session");
+        await clickAction(submitOtp);
+        await page.waitForTimeout(800);
+        if (await otpField.isVisible().catch(() => false)) throw new Escalation("OTP was not accepted; refusing to guess or auto-retry");
       }
-      done(9); done(10); done(11);
+      done(11); log(11, "Email verification stage completed");
 
-      await completeStepWithRecovery(
-        12,
-        "Complete the contact details form using only payload-backed customer values",
-        () => fillContactAndAdvance(page, payload),
-        /service address|delivery address|self care portal|connection details|new connection|transfer connection/i,
-      );
-      done(12); log(12, "Contact details submitted; progression verified");
+      await runRecoverable({
+        step: 12,
+        goal: "Complete contact details using only payload-backed customer values and advance",
+        deterministic: () => fillContactAndAdvance(page, payload),
+        verified: async () => /service address|delivery address|self care portal|connection details|new connection|transfer connection/i.test(await bodyText()),
+        attempts: 3,
+      });
+      done(12); log(12, "Contact details completed and next state verified");
 
-      await completeStepWithRecovery(
-        13,
-        "Complete the service and delivery address step using only the supplied address",
-        () => fillService(page, payload),
-        /current provider|avc|new connection|transfer connection|process order|donation|small change big change/i,
-      );
-      done(13); log(13, "Service/delivery step submitted; progression verified");
+      await runRecoverable({
+        step: 13,
+        goal: "Complete service and delivery address using only the supplied payload address and advance",
+        deterministic: () => fillService(page, payload),
+        verified: async () => /current provider|avc|new connection|transfer connection|process order|donation|small change big change/i.test(await bodyText()),
+        attempts: 3,
+      });
+      done(13); log(13, "Service/delivery details completed and next state verified");
 
-      await completeStepWithRecovery(
-        14,
-        "Complete connection activation/transfer details from the payload and assignment-safe defaults",
-        () => fillConnection(page, payload),
-        /donation|small change big change|name on card|payment details|card number|pay now/i,
-      );
-      done(14); log(14, "Connection details submitted; progression verified");
+      await runRecoverable({
+        step: 14,
+        goal: "Complete connection activation/transfer/provider/date choices from payload and assignment-safe defaults, then Process Order and Pay",
+        deterministic: () => fillConnection(page, payload),
+        verified: async () => /donation|small change big change|name on card|payment details|card number|pay now/i.test(await bodyText()),
+        attempts: 3,
+      });
+      done(14); log(14, "Connection details completed and next state verified");
 
-      await declineDonationAndAdvance(page);
-      const reachedPaymentAfterDonation = await bodyMatches(/name on card|payment details|card number|pay now|order summary/i);
-      if (!reachedPaymentAfterDonation) {
-        await humanResolveEscalation(15, "Donation was handled, but the checkout did not reach the payment/order-summary state.");
-        if (!(await bodyMatches(/name on card|payment details|card number|pay now|order summary/i))) {
-          throw new Escalation("Donation step did not reach payment/order-summary state after human recovery");
-        }
-      }
-      done(15); log(15, "Donation step cleared; payment/order-summary state verified");
+      await runRecoverable({
+        step: 15,
+        goal: "Decline the optional donation and advance to payment/order summary",
+        deterministic: () => declineDonationAndAdvance(page),
+        verified: async () => /name on card|payment details|card number|pay now|order summary/i.test(await bodyText()),
+        attempts: 2,
+      });
+      done(15); log(15, "Donation declined; payment/order-summary state verified");
 
       await verifyOrderSummary(page, payload);
       log(15, "Order summary verified; entering guarded payment boundary");
@@ -324,23 +341,27 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
         await humanResolveEscalation(16, "Final Pay Now control is missing. Resolve only the page/UI issue manually; do not submit payment yourself.");
         const retryPay = page.locator("button, a, [role='button'], input[type='submit'], input[type='button']").filter({ hasText: /pay now/i }).first();
         if (!(await retryPay.count())) throw new Escalation("Final Pay Now control still missing after human recovery");
-        await clickAction(retryPay); done(16);
+        await clickAction(retryPay);
       } else {
-        await clickAction(pay); done(16);
+        await clickAction(pay);
       }
-
+      done(16);
 
       const modal = page.getByRole("dialog").first();
       if (await modal.count()) {
         const checks = modal.locator('input[type="checkbox"]');
         for (let index = 0; index < (await checks.count()); index += 1) await checks.nth(index).check();
         const modalPay = modal.locator("button, a, [role='button'], input[type='submit'], input[type='button']").filter({ hasText: /pay now/i }).first();
-        if (!(await modalPay.count())) throw new Escalation("Confirmation Pay Now missing; guarded step will not heal");
+        if (!(await modalPay.count())) throw new Escalation("Confirmation Pay Now missing; guarded step will not free-form heal");
         await clickAction(modalPay);
       }
       done(17);
-      transactionId = await handle3dsAndTransaction(page); done(18); done(19);
-      if (!/payment|card number|security code|cvv/i.test(await page.locator("body").innerText())) {
+
+      // After final Pay Now there is deliberately no generic retry: uncertainty
+      // here can duplicate a payment/order.
+      transactionId = await handle3dsAndTransaction(page);
+      done(18); done(19);
+      if (!/payment|card number|security code|cvv/i.test(await bodyText())) {
         sensitiveMode = false;
         await page.screenshot({ path: path.join(evidenceDir, `${transactionId}.png`), fullPage: true });
       }
@@ -351,26 +372,28 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
     for (let attempt = 1; attempt <= 3 && orderStatus === "checkoutBounce"; attempt += 1) {
       if (attempt > 1) {
         await resetSession();
-        let navigated = false;
-        for (let navAttempt = 1; navAttempt <= 3 && !navigated; navAttempt += 1) {
-          try { await page.goto(payload.portal.url, { waitUntil: "domcontentloaded", timeout: 30_000 }); navigated = true; }
-          catch { await page.waitForTimeout(2000); }
-        }
-        if (!navigated) continue;
-        await page.waitForTimeout(4000);
+        try { await page.goto(payload.portal.url, { waitUntil: "domcontentloaded", timeout: 30_000 }); }
+        catch { continue; }
+        await page.waitForTimeout(2000);
       }
       orderStatus = await runOrder();
-      if (orderStatus === "checkoutBounce") log(9, `Checkout bounce on attempt ${attempt}; retrying`, { url: page.url() });
     }
-    if (orderStatus === "checkoutBounce") throw new Error("Order Now did not reach checkout after retries");
-    const report = makeReport("success", transactionId); await writeReport(report); await leakScan(evidenceDir); return report;
+    if (orderStatus === "checkoutBounce") throw new Escalation("Checkout could not be reached after guarded retries");
+
+    const report = makeReport("success", transactionId);
+    await writeReport(report);
+    await leakScan(evidenceDir);
+    return report;
   } catch (error) {
     const escalated = error instanceof Escalation;
     const reason = error instanceof Error ? error.message : String(error);
     const report = makeReport(escalated ? "escalated" : "failed", undefined, reason);
     if (!sensitiveMode) await page.screenshot({ path: path.join(evidenceDir, "failure.png"), fullPage: true }).catch(() => undefined);
-    await writeReport(report); await leakScan(evidenceDir); return report;
+    await writeReport(report);
+    await leakScan(evidenceDir);
+    return report;
   } finally {
-    await context.close(); await browser.close();
+    await context.close().catch(() => undefined);
+    await browser.close().catch(() => undefined);
   }
 }
