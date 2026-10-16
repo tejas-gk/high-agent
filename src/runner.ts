@@ -7,7 +7,7 @@ import { installMutationLayer } from "./mutation";
 import { leakScan } from "./security";
 import { declineDonationAndAdvance, fillContactAndAdvance } from "./checkout-progress";
 import type { JobPayload } from "./payload";
-import type { HealEvent, HumanRequestType, RunReport, TraceEvent } from "./types";
+import { describeCompletedSteps, type HealEvent, type HumanRequestType, type RunReport, type TraceEvent } from "./types";
 import {
   activePopupId, checkAllVisible, chooseAddressSuggestion, clickAction, clickOrderNow,
   Escalation, fillConnection, fillManual, fillService, fillVerified,
@@ -54,7 +54,7 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
   };
   const done = (step: number) => { if (!completed.includes(step)) completed.push(step); };
   const makeReport = (status: "success" | "failed" | "escalated", transactionId?: string, failureReason?: string): RunReport => ({
-    jobId, status, transactionId, completedSteps: completed, heals,
+    jobId, status, transactionId, completedSteps: completed, completedStepDetails: describeCompletedSteps(completed), heals,
     startedAt: new Date(started).toISOString(), finishedAt: new Date().toISOString(),
     durationMs: Date.now() - started, modelCalls: modelBudget.used, failureReason, evidenceDir,
   });
@@ -84,7 +84,7 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
     if (await page.locator(selector).filter({ visible: true }).count()) return;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
-        const recovered = await recoverUnexpectedPage(page, { step, goal, expected: selector, modelBudget, heals });
+        const recovered = await recoverUnexpectedPage(page, { step, goal, expected: selector, payload, modelBudget, heals });
         if (recovered && (await page.locator(selector).filter({ visible: true }).count())) {
           log(step, "AI re-planned around an unexpected page and verified recovery");
           return;
@@ -166,7 +166,7 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
         if (await otpField.isVisible().catch(() => false) && /checkout\/login/i.test(page.url())) throw new Escalation("OTP was not accepted; refusing to guess or retry automatically");
         log(11, "Email verification complete; resumed same browser session");
       }
-      done(11);
+      done(9); done(10); done(11);
 
       await ensureExpectedState(12, "Reach the contact details form", "#fname, input[name='fname' i], #salutation");
       await fillContactAndAdvance(page, payload); done(12); log(12, "Contact details submitted; verified page advanced");
@@ -204,7 +204,7 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
     };
 
     let orderStatus: "ok" | "checkoutBounce" = "checkoutBounce";
-    for (let attempt = 1; attempt <= 6 && orderStatus === "checkoutBounce"; attempt += 1) {
+    for (let attempt = 1; attempt <= 3 && orderStatus === "checkoutBounce"; attempt += 1) {
       if (attempt > 1) {
         await resetSession();
         let navigated = false;
