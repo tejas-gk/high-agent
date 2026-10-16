@@ -8,6 +8,7 @@ export type Candidate = {
   name: string;
   placeholder: string;
   type: string;
+  label: string;
 };
 
 export type Observation = {
@@ -53,6 +54,17 @@ export async function observe(page: Page): Promise<Observation> {
         ),
         placeholder: clean(element.getAttribute("placeholder")),
         type: clean(element.getAttribute("type")),
+        label: clean((() => {
+          const aria = element.getAttribute("aria-label");
+          if (aria) return aria;
+          const id = element.getAttribute("id");
+          if (id) {
+            const explicit = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+            if (explicit?.textContent) return explicit.textContent;
+          }
+          const wrapping = element.closest("label");
+          return wrapping?.textContent || "";
+        })()),
       }));
 
     return {
