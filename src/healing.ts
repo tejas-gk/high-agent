@@ -17,8 +17,8 @@ export async function semanticLocator(page: Page, args: { step: number; intent: 
   }
   if (args.modelBudget.used >= args.modelBudget.max) throw new Error("Model-call budget exhausted");
   const o = await observe(page);
-  const choice = await chooseCandidate({ intent: args.intent, observation: o, candidates: o.candidates });
   args.modelBudget.used++;
+  const choice = await chooseCandidate({ intent: args.intent, observation: o, candidates: o.candidates });
   if (!choice || choice.confidence < 0.7) throw new Error("No high-confidence semantic recovery");
   const c = o.candidates.find((x) => x.id === choice.candidateId);
   if (!c) throw new Error("AI selected unknown candidate");
@@ -71,14 +71,14 @@ export async function recoverUnexpectedPage(page: Page, args: { step: number; go
   };
 
   if (visibleInputs.length) {
-    const plan = await planPayloadForm({ goal: args.goal, observation, candidates: [...visibleInputs, ...safeActions] });
     args.modelBudget.used++;
+    const plan = await planPayloadForm({ goal: args.goal, observation, candidates: [...visibleInputs, ...safeActions] });
     if (plan && plan.confidence >= 0.72) {
       for (const assignment of plan.assignments) {
         const value = valueFor(assignment.valueKey);
         if (!value) continue;
         const candidate = observation.candidates.find((x) => x.id === assignment.candidateId);
-        if (!candidate || !["input","select","textarea"].includes(candidate.tag)) continue;
+        if (!candidate || !["input", "select", "textarea"].includes(candidate.tag)) continue;
         const control = page.locator("button:visible,a:visible,input:visible,select:visible,textarea:visible,[role=button]:visible,[role=radio]:visible,[role=checkbox]:visible").nth(candidate.id - 1);
         if (candidate.tag === "select") {
           const options = await control.locator("option").allTextContents().catch(() => []);
@@ -113,12 +113,13 @@ export async function recoverUnexpectedPage(page: Page, args: { step: number; go
   }
 
   if (safeActions.length) {
+    if (args.modelBudget.used >= args.modelBudget.max) throw new Error("Model-call budget exhausted");
+    args.modelBudget.used++;
     const choice = await chooseCandidate({
       intent: `${args.goal}. The current page may have changed structure, tags, ids, classes, labels, layout or step order. Choose only a safe navigation/dismiss action that advances the existing payload-backed journey. Do not invent a value or accept a new preference.`,
       observation,
       candidates: safeActions,
     });
-    args.modelBudget.used++;
     if (choice && choice.confidence >= 0.75) {
       const selected = safeActions.find((candidate) => candidate.id === choice.candidateId);
       if (selected) {
