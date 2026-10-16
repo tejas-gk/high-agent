@@ -9,7 +9,7 @@ import { declineDonationAndAdvance, fillContactAndAdvance } from "./checkout-pro
 import type { JobPayload } from "./payload";
 import { describeCompletedSteps, type HealEvent, type HumanRequestType, type RunReport, type TraceEvent } from "./types";
 import {
-  activePopupId, checkAllVisible, chooseAddressSuggestion, clickAction, clickOrderNow,
+  activePopupId, assertNbnPlanInCart, checkAllVisible, chooseAddressSuggestion, clickAction, clickOrderNow,
   Escalation, fillConnection, fillManual, fillService, fillVerified,
   handle3dsAndTransaction, resolvePopup, selectPlan, selectRouter,
   settlePopups, typeAddress, verifyOrderSummary, waitForAddressResult,
@@ -169,9 +169,36 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
       done(3); log(3, "Address confirmed", { techResult });
       await settlePopups(page); done(4);
       await selectPlan(page, payload.plan.name); await settlePopups(page);
-      if (payload.addOns.router.enabled) { await selectRouter(page, payload.addOns.router.model || "BYO Modem"); await settlePopups(page); }
-      done(5); done(6); if (payload.addOns.router.enabled) done(7); done(8);
-      await clickOrderNow(page);
+      done(5); done(6);
+      if (payload.addOns.router.enabled) {
+        await selectRouter(page, payload.addOns.router.model || "BYO Modem");
+        await settlePopups(page);
+        done(7);
+        try {
+          await assertNbnPlanInCart(page, payload.plan.name);
+        } catch {
+          log(8, "Router selection reset the cart; re-selecting the requested plan");
+          await selectPlan(page, payload.plan.name);
+          await settlePopups(page);
+          await assertNbnPlanInCart(page, payload.plan.name);
+        }
+      } else {
+        await assertNbnPlanInCart(page, payload.plan.name);
+      }
+      done(8);
+
+      let checkoutReached = false;
+      for (let orderAttempt = 1; orderAttempt <= 3 && !checkoutReached; orderAttempt += 1) {
+        await clickOrderNow(page);
+        checkoutReached = /checkout|login/i.test(page.url());
+        if (!checkoutReached) {
+          const body = await page.locator("body").innerText().catch(() => "");
+          if (/hold\s*on/i.test(body) && /modem|router|plan/i.test(body)) {
+            throw new Escalation("Cart integrity alarm: modem/router present without a valid NBN plan");
+          }
+          await page.waitForTimeout(700);
+        }
+      }
       const popupId = await activePopupId(page);
       const onCheckout = /checkout|login/i.test(page.url());
       log(9, "Order Now clicked", { url: page.url(), popupId, onCheckout });
@@ -189,6 +216,10 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
       await clickAction(emailNext);
 
       await page.waitForTimeout(1000);
+      const loginBody = await page.locator("body").innerText().catch(() => "");
+      if (/no plan|plan.*missing|select.*plan|choose.*plan/i.test(loginBody) && /checkout|order/i.test(loginBody)) {
+        throw new Escalation("Checkout reported a missing NBN plan; refusing to continue with an invalid cart");
+      }
       if (await captchaPresent()) {
         await humanCaptcha(11);
         if (/checkout\/login/i.test(page.url()) && await emailNext.isVisible().catch(() => false)) await clickAction(emailNext);
