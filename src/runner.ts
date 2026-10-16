@@ -1,8 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-
 import { chromium } from "playwright";
-
 import { recoverUnexpectedPage } from "./healing";
 import { executePayment } from "./payment";
 import { installMutationLayer } from "./mutation";
@@ -10,26 +8,10 @@ import { leakScan } from "./security";
 import type { JobPayload } from "./payload";
 import type { HealEvent, HumanRequestType, RunReport, TraceEvent } from "./types";
 import {
-  activePopupId,
-  checkAllVisible,
-  chooseAddressSuggestion,
-  clickAction,
-  clickOrderNow,
-  Escalation,
-  fillConnection,
-  fillContact,
-  fillManual,
-  fillService,
-  fillVerified,
-  findAction,
-  handle3dsAndTransaction,
-  resolvePopup,
-  selectPlan,
-  selectRouter,
-  settlePopups,
-  typeAddress,
-  verifyOrderSummary,
-  waitForAddressResult,
+  activePopupId, checkAllVisible, chooseAddressSuggestion, clickAction, clickOrderNow,
+  Escalation, fillConnection, fillContact, fillManual, fillService, fillVerified,
+  findAction, handle3dsAndTransaction, resolvePopup, selectPlan, selectRouter,
+  settlePopups, typeAddress, verifyOrderSummary, waitForAddressResult,
 } from "./runner-helpers";
 
 export type RunnerOptions = {
@@ -37,11 +19,7 @@ export type RunnerOptions = {
   payload: JobPayload;
   mutate: boolean;
   emit: (event: TraceEvent) => void;
-  requestHumanInput?: (request: {
-    type: HumanRequestType;
-    step: number;
-    message: string;
-  }) => Promise<string>;
+  requestHumanInput?: (request: { type: HumanRequestType; step: number; message: string }) => Promise<string>;
 };
 
 export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput }: RunnerOptions): Promise<RunReport> {
@@ -52,13 +30,13 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
   const evidenceDir = path.resolve("artifacts", jobId);
   const previewPath = path.join(evidenceDir, "live.png");
   let sensitiveMode = false;
-
   await fs.mkdir(evidenceDir, { recursive: true });
 
-  const browser = await chromium.launch({ headless: process.env.HEADLESS !== "false" });
+  // Local interview/demo runs are headed by default so a human can solve CAPTCHA.
+  // Set HEADLESS=true explicitly for environments where no guarded challenge is expected.
+  const browser = await chromium.launch({ headless: process.env.HEADLESS === "true" });
   const context = await browser.newContext();
   let page = await context.newPage();
-
   if (mutate) await installMutationLayer(page);
 
   const resetSession = async () => {
@@ -67,126 +45,86 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
     page = await context.newPage();
     if (mutate) await installMutationLayer(page);
   };
-
   const capturePreview = async () => {
-    // Once payment begins, keep the last safe preview. Never screenshot card fields.
     if (sensitiveMode) return;
-    try {
-      await page.screenshot({ path: previewPath, fullPage: false, animations: "disabled" });
-    } catch (error) {
-      console.warn(`[job:${jobId}] preview capture failed`, error);
-    }
+    await page.screenshot({ path: previewPath, fullPage: false, animations: "disabled" }).catch(() => undefined);
   };
-
   const log = (step: number, message: string, data?: Record<string, unknown>) => {
-    const entry: TraceEvent = { at: new Date().toISOString(), level: "info", step, message, data };
-    console.log(`[job:${jobId}] step ${step}: ${message}`, data ? JSON.stringify(data) : "");
-    emit(entry);
+    emit({ at: new Date().toISOString(), level: "info", step, message, data });
     void capturePreview();
   };
+  const done = (step: number) => { if (!completed.includes(step)) completed.push(step); };
+  const makeReport = (status: "success" | "failed" | "escalated", transactionId?: string, failureReason?: string): RunReport => ({
+    jobId, status, transactionId, completedSteps: completed, heals,
+    startedAt: new Date(started).toISOString(), finishedAt: new Date().toISOString(),
+    durationMs: Date.now() - started, modelCalls: modelBudget.used, failureReason, evidenceDir,
+  });
+  const writeReport = (report: RunReport) => fs.writeFile(path.join(evidenceDir, "report.json"), JSON.stringify(report, null, 2));
 
-  const done = (step: number) => {
-    if (!completed.includes(step)) completed.push(step);
+  const captchaPresent = async () => {
+    const challengeFrame = page.frames().some((frame) => /recaptcha.*(bframe|challenge)|hcaptcha/i.test(frame.url()));
+    if (challengeFrame) return true;
+    const text = await page.locator("body").innerText().catch(() => "");
+    return /verify you are human|i am not a robot|captcha challenge/i.test(text);
   };
 
-  const makeReport = (
-    status: "success" | "failed" | "escalated",
-    transactionId?: string,
-    failureReason?: string,
-  ): RunReport => ({
-    jobId,
-    status,
-    transactionId,
-    completedSteps: completed,
-    heals,
-    startedAt: new Date(started).toISOString(),
-    finishedAt: new Date().toISOString(),
-    durationMs: Date.now() - started,
-    modelCalls: modelBudget.used,
-    failureReason,
-    evidenceDir,
-  });
-
-  const writeReport = async (report: RunReport) => {
-    await fs.writeFile(path.join(evidenceDir, "report.json"), JSON.stringify(report, null, 2));
+  const humanCaptcha = async (step: number) => {
+    if (!requestHumanInput) throw new Escalation("CAPTCHA requires human completion");
+    log(step, "Human handoff: CAPTCHA requires manual completion; browser session preserved");
+    await capturePreview();
+    await requestHumanInput({
+      type: "CAPTCHA",
+      step,
+      message: "A CAPTCHA is blocking the signup. Solve it in the opened Tangerine browser window, then return here and click ‘I solved the CAPTCHA — continue’. Do not close the browser.",
+    });
+    await page.waitForTimeout(500);
+    if (await captchaPresent()) throw new Escalation("CAPTCHA is still active after human handoff");
+    log(step, "CAPTCHA cleared by human; agent resumed the same browser session");
   };
 
   const ensureExpectedState = async (step: number, goal: string, selector: string) => {
     if (await page.locator(selector).filter({ visible: true }).count()) return;
-
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
-        const recovered = await recoverUnexpectedPage(page, {
-          step,
-          goal,
-          expected: selector,
-          modelBudget,
-          heals,
-        });
+        const recovered = await recoverUnexpectedPage(page, { step, goal, expected: selector, modelBudget, heals });
         if (recovered && (await page.locator(selector).filter({ visible: true }).count())) {
           log(step, "AI re-planned around an unexpected page and verified recovery");
           return;
         }
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
-        if (reason.startsWith("HUMAN_REQUIRED:")) {
-          throw new Escalation(reason.replace("HUMAN_REQUIRED:", "Human handoff required: "));
+        if (reason === "HUMAN_REQUIRED:CAPTCHA") {
+          await humanCaptcha(step);
+          if (await page.locator(selector).filter({ visible: true }).count()) return;
+          continue;
         }
+        if (reason === "HUMAN_REQUIRED:EMAIL_OTP") throw new Escalation("Email OTP appeared outside the guarded checkout handoff");
         throw new Escalation(reason);
       }
     }
-
     throw new Escalation(`Could not safely reach expected state: ${goal}`);
   };
 
   try {
     await page.goto(payload.portal.url, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    if (!page.url().includes("test-tangerine.hipeely.com")) {
-      throw new Error("Portal URL did not match approved test environment");
-    }
-
-    done(1);
-    log(1, "Portal opened");
+    if (!page.url().includes("test-tangerine.hipeely.com")) throw new Error("Portal URL did not match approved test environment");
+    done(1); log(1, "Portal opened");
 
     const selectAndOrder = async (): Promise<boolean> => {
-      await typeAddress(page, payload.connectionAddress.mainAddress.fullAddress);
-      done(2);
-      log(2, "Address entered");
-
+      await typeAddress(page, payload.connectionAddress.mainAddress.fullAddress); done(2); log(2, "Address entered");
       const selected = await chooseAddressSuggestion(page, payload.connectionAddress.mainAddress.fullAddress);
       if (!selected) {
-        const manual = page
-          .locator("button, a, [role='button']")
-          .filter({ hasText: /enter.*address.*manually|check your address manually|can't find your address/i })
-          .first();
-        if (!(await manual.isVisible().catch(() => false))) {
-          throw new Escalation("Address suggestion unavailable; manual address path not found");
-        }
-        await clickAction(manual);
-        await fillManual(page, payload);
+        const manual = page.locator("button, a, [role='button']").filter({ hasText: /enter.*address.*manually|check your address manually|can't find your address/i }).first();
+        if (!(await manual.isVisible().catch(() => false))) throw new Escalation("Address suggestion unavailable; manual address path not found");
+        await clickAction(manual); await fillManual(page, payload);
       }
-
       await waitForAddressResult(page);
       const techResult = await resolvePopup(page, /build your plan|see nbn|see other plans|continue with nbn|pre-?order/i);
-      done(3);
-      log(3, "Address confirmed", { techResult });
-
-      await settlePopups(page);
-      done(4);
-
-      await selectPlan(page, payload.plan.name);
-      await settlePopups(page);
-
-      if (payload.addOns.router.enabled) {
-        await selectRouter(page, payload.addOns.router.model || "BYO Modem");
-        await settlePopups(page);
-      }
-
-      done(5);
-      done(6);
-      if (payload.addOns.router.enabled) done(7);
-      done(8);
-
+      done(3); log(3, "Address confirmed", { techResult });
+      await settlePopups(page); done(4);
+      await selectPlan(page, payload.plan.name); await settlePopups(page);
+      if (payload.addOns.router.enabled) { await selectRouter(page, payload.addOns.router.model || "BYO Modem"); await settlePopups(page); }
+      done(5); done(6); if (payload.addOns.router.enabled) done(7); done(8);
       await clickOrderNow(page);
       const popupId = await activePopupId(page);
       const onCheckout = /checkout|login/i.test(page.url());
@@ -195,157 +133,83 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
     };
 
     let transactionId: string | undefined;
-
     const runOrder = async (): Promise<"ok" | "checkoutBounce"> => {
       if (!(await selectAndOrder())) return "checkoutBounce";
-
-      const email = page
-        .locator('#email, input[type="email"], input[name*="email" i]')
-        .filter({ visible: true })
-        .first();
+      const email = page.locator('#email, input[type="email"], input[name*="email" i]').filter({ visible: true }).first();
       if (!(await email.count())) throw new Escalation("Checkout email field not found");
       await fillVerified(page, email, payload.customer.email);
-
-      const emailNext = page
-        .locator("button, a, input[type='submit'], input[type='button']")
-        .filter({ hasText: /next/i })
-        .filter({ visible: true })
-        .first();
+      const emailNext = page.locator("button, a, input[type='submit'], input[type='button']").filter({ hasText: /next/i }).filter({ visible: true }).first();
       if (!(await emailNext.count())) throw new Escalation("Checkout Next control not found");
       await clickAction(emailNext);
+
+      // CAPTCHA can be injected by the portal after the email submit. It is guarded:
+      // human solves it in the headed browser, then the same session resumes.
+      await page.waitForTimeout(1000);
+      if (await captchaPresent()) {
+        await humanCaptcha(11);
+        // Some CAPTCHA integrations require the original submit once more after solving.
+        if (/checkout\/login/i.test(page.url()) && await emailNext.isVisible().catch(() => false)) await clickAction(emailNext);
+      }
 
       let navigated = false;
       const emailDeadline = Date.now() + 12_000;
       while (Date.now() < emailDeadline && !navigated) {
-        if (
-          !/checkout\/login/i.test(page.url()) ||
-          (await page.locator("#fname, input[name='fname' i], #salutation").count())
-        ) {
-          navigated = true;
-          break;
-        }
+        if (!/checkout\/login/i.test(page.url()) || (await page.locator("#fname, input[name='fname' i], #salutation").count())) { navigated = true; break; }
         await page.waitForTimeout(400);
       }
 
       const stillOnLogin = /checkout\/login/i.test(page.url());
-      const otpField = page
-        .locator('input[autocomplete="one-time-code"], input[name*="otp" i], input[id*="otp" i], input[name*="verification" i]')
-        .filter({ visible: true })
-        .first();
-
+      const otpField = page.locator('input[autocomplete="one-time-code"], input[name*="otp" i], input[id*="otp" i], input[name*="verification" i]').filter({ visible: true }).first();
       if (stillOnLogin && (await otpField.count())) {
         if (!requestHumanInput) throw new Escalation("Email OTP requires human submission");
-
         log(11, "Human handoff: waiting for email OTP; browser session preserved");
-        const otp = await requestHumanInput({
-          type: "EMAIL_OTP",
-          step: 11,
-          message: "Check the verification email, enter the one-time code here, then the agent will continue automatically.",
-        });
-
+        const otp = await requestHumanInput({ type: "EMAIL_OTP", step: 11, message: "Check the verification email and enter the one-time code here. The agent will submit it and continue in the same browser session." });
         await otpField.fill(otp);
-        const submitOtp = page
-          .locator("button, input[type='submit'], input[type='button']")
-          .filter({ hasText: /verify|submit|continue|next/i })
-          .filter({ visible: true })
-          .first();
+        const submitOtp = page.locator("button, input[type='submit'], input[type='button']").filter({ hasText: /verify|submit|continue|next/i }).filter({ visible: true }).first();
         if (!(await submitOtp.count())) throw new Escalation("OTP submit control not found after human handoff");
-
-        await clickAction(submitOtp);
-        await page.waitForTimeout(800);
-        const otpStillVisible = await otpField.isVisible().catch(() => false);
-        if (otpStillVisible && /checkout\/login/i.test(page.url())) {
-          throw new Escalation("OTP was not accepted; refusing to guess or retry automatically");
-        }
-        log(11, "Human handoff complete; resumed same browser session");
+        await clickAction(submitOtp); await page.waitForTimeout(800);
+        if (await otpField.isVisible().catch(() => false) && /checkout\/login/i.test(page.url())) throw new Escalation("OTP was not accepted; refusing to guess or retry automatically");
+        log(11, "Email verification complete; resumed same browser session");
       }
-
       done(11);
 
-      // The normal path is deterministic. If the portal inserts/reorders a harmless
-      // interstitial, Sarvam gets the redacted observation and may choose only a
-      // safe navigation/dismiss action. New required customer values escalate.
       await ensureExpectedState(12, "Reach the contact details form", "#fname, input[name='fname' i], #salutation");
-      await fillContact(page, payload);
-      done(12);
-
-      await fillService(page, payload);
-      done(13);
-
-      await fillConnection(page, payload);
-      done(14);
+      await fillContact(page, payload); done(12);
+      await fillService(page, payload); done(13);
+      await fillConnection(page, payload); done(14);
 
       if (await page.getByText(/donat/i).count()) {
-        const no = page
-          .getByLabel(/^no$/i)
-          .first()
-          .or(page.locator('input[type="radio"][value="no" i]').first());
+        const no = page.getByLabel(/^no$/i).first().or(page.locator('input[type="radio"][value="no" i]').first());
         if (await no.count()) await no.check();
-
-        const next = await findAction(page, {
-          step: 15,
-          intent: "Decline donation and continue to payment",
-          names: ["Next", "Continue"],
-          modelBudget,
-          heals,
-        });
+        const next = await findAction(page, { step: 15, intent: "Decline donation and continue to payment", names: ["Next", "Continue"], modelBudget, heals });
         await clickAction(next);
       }
-
       done(15);
 
-      const beforeSummary = await page.evaluate(() => ({
-        url: location.href,
-        body: document.body.innerText.replace(/\s+/g, " ").slice(0, 400),
-      }));
-      log(15, "Before order summary", beforeSummary);
+      log(15, "Reached order summary; validating plan, price and address before payment");
       await verifyOrderSummary(page, payload);
-
-      // From here on screenshots/previews are disabled. Card data exists only in
-      // the isolated deterministic payment executor, never in AI observations.
       sensitiveMode = true;
-      const payResult = await executePayment(page, {
-        jobId,
-        cardRef: payload.payment.cardRef,
-        nameOnCard: payload.payment.nameOnCard,
-      });
+      const payResult = await executePayment(page, { jobId, cardRef: payload.payment.cardRef, nameOnCard: payload.payment.nameOnCard });
       log(16, "Payment fields filled by isolated executor", { last4: payResult.last4 });
       await checkAllVisible(page);
-
-      const pay = page
-        .locator("button, a, [role='button'], input[type='submit'], input[type='button']")
-        .filter({ hasText: /pay now/i })
-        .first();
+      const pay = page.locator("button, a, [role='button'], input[type='submit'], input[type='button']").filter({ hasText: /pay now/i }).first();
       if (!(await pay.count())) throw new Escalation("Final Pay Now control missing; guarded step will not heal");
-
-      await clickAction(pay);
-      done(16);
+      await clickAction(pay); done(16);
 
       const modal = page.getByRole("dialog").first();
       if (await modal.count()) {
         const checks = modal.locator('input[type="checkbox"]');
         for (let index = 0; index < (await checks.count()); index += 1) await checks.nth(index).check();
-
-        const modalPay = modal
-          .locator("button, a, [role='button'], input[type='submit'], input[type='button']")
-          .filter({ hasText: /pay now/i })
-          .first();
+        const modalPay = modal.locator("button, a, [role='button'], input[type='submit'], input[type='button']").filter({ hasText: /pay now/i }).first();
         if (!(await modalPay.count())) throw new Escalation("Confirmation Pay Now missing; guarded step will not heal");
         await clickAction(modalPay);
       }
-
       done(17);
-      transactionId = await handle3dsAndTransaction(page);
-      done(18);
-      done(19);
-
-      // Re-enable evidence only after the transaction has completed and card UI
-      // is no longer present. The final screenshot is named after transaction ID.
+      transactionId = await handle3dsAndTransaction(page); done(18); done(19);
       if (!/payment|card number|security code|cvv/i.test(await page.locator("body").innerText())) {
         sensitiveMode = false;
         await page.screenshot({ path: path.join(evidenceDir, `${transactionId}.png`), fullPage: true });
       }
-
       return "ok";
     };
 
@@ -355,48 +219,24 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
         await resetSession();
         let navigated = false;
         for (let navAttempt = 1; navAttempt <= 3 && !navigated; navAttempt += 1) {
-          try {
-            await page.goto(payload.portal.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
-            navigated = true;
-          } catch {
-            await page.waitForTimeout(2000);
-          }
+          try { await page.goto(payload.portal.url, { waitUntil: "domcontentloaded", timeout: 30_000 }); navigated = true; }
+          catch { await page.waitForTimeout(2000); }
         }
         if (!navigated) continue;
         await page.waitForTimeout(4000);
       }
-
       orderStatus = await runOrder();
-      if (orderStatus === "checkoutBounce") {
-        log(9, `Checkout bounce on attempt ${attempt}; retrying`, { url: page.url() });
-      }
+      if (orderStatus === "checkoutBounce") log(9, `Checkout bounce on attempt ${attempt}; retrying`, { url: page.url() });
     }
-
     if (orderStatus === "checkoutBounce") throw new Error("Order Now did not reach checkout after retries");
-
-    const report = makeReport("success", transactionId);
-    await writeReport(report);
-    await leakScan(evidenceDir);
-    return report;
+    const report = makeReport("success", transactionId); await writeReport(report); await leakScan(evidenceDir); return report;
   } catch (error) {
     const escalated = error instanceof Escalation;
     const reason = error instanceof Error ? error.message : String(error);
     const report = makeReport(escalated ? "escalated" : "failed", undefined, reason);
-
-    // Failure screenshots are also suppressed if the run entered payment mode.
-    if (!sensitiveMode) {
-      try {
-        await page.screenshot({ path: path.join(evidenceDir, "failure.png"), fullPage: true });
-      } catch {
-        // Page may already be closed.
-      }
-    }
-
-    await writeReport(report);
-    await leakScan(evidenceDir);
-    return report;
+    if (!sensitiveMode) await page.screenshot({ path: path.join(evidenceDir, "failure.png"), fullPage: true }).catch(() => undefined);
+    await writeReport(report); await leakScan(evidenceDir); return report;
   } finally {
-    await context.close();
-    await browser.close();
+    await context.close(); await browser.close();
   }
 }
