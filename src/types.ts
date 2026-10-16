@@ -33,11 +33,22 @@ export type HealEvent = {
   evidence: string;
   verified: boolean;
 };
+
+export type CompletedStep = {
+  step: number;
+  name: string;
+  description: string;
+  completedAt: string;
+};
+
 export type RunReport = {
   jobId: string;
   status: "success" | "failed" | "escalated";
   transactionId?: string;
+  /** Kept for machine/backwards compatibility. */
   completedSteps: number[];
+  /** Human-readable evidence of what actually completed. */
+  completedStepDetails: CompletedStep[];
   heals: HealEvent[];
   startedAt: string;
   finishedAt: string;
