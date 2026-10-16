@@ -13,7 +13,8 @@ export async function chooseCandidate(args: {
 }): Promise<AiChoice | null> {
   const key = process.env.AI_API_KEY;
   const url = process.env.AI_API_URL;
-  const model = process.env.AI_MODEL;
+  const configuredModel = process.env.AI_MODEL;
+  const model = configuredModel === "sarvam-m" ? "sarvam-105b" : configuredModel;
 
   if (!key || !url || !model) {
     return null;
@@ -119,7 +120,8 @@ export async function planPayloadForm(args: {
 }): Promise<AiFormPlan | null> {
   const key = process.env.AI_API_KEY;
   const url = process.env.AI_API_URL;
-  const model = process.env.AI_MODEL;
+  const configuredModel = process.env.AI_MODEL;
+  const model = configuredModel === "sarvam-m" ? "sarvam-105b" : configuredModel;
   if (!key || !url || !model) return null;
 
   const allowedKeys: PayloadFieldKey[] = [
