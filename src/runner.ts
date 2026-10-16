@@ -20,10 +20,11 @@ export type RunnerOptions = {
   payload: JobPayload;
   mutate: boolean;
   emit: (event: TraceEvent) => void;
+  checkpoint?: () => Promise<"normal" | "resumed">;
   requestHumanInput?: (request: { type: HumanRequestType; step: number; message: string }) => Promise<string>;
 };
 
-export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput }: RunnerOptions): Promise<RunReport> {
+export async function runAgent({ jobId, payload, mutate, emit, checkpoint, requestHumanInput }: RunnerOptions): Promise<RunReport> {
   const started = Date.now();
   const completed: number[] = [];
   const heals: HealEvent[] = [];
@@ -60,6 +61,45 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
   });
   const writeReport = (report: RunReport) => fs.writeFile(path.join(evidenceDir, "report.json"), JSON.stringify(report, null, 2));
   const bodyText = async () => (await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " ");
+
+  // Returns the next workflow step implied by the page that is currently open.
+  // This lets a paused run resume from a page the human navigated to manually,
+  // rather than blindly returning to the step that originally paused.
+  const detectJourneyStep = async (): Promise<number> => {
+    const text = (await bodyText()).toUpperCase();
+    const url = page.url();
+
+    if (/TRANSACTION\s*(?:ID|NUMBER)|ORDER\s*(?:CONFIRMED|NUMBER)|THANK YOU.*ORDER/i.test(text)) return 20;
+    if (/3.?D SECURE|AUTHENTICATED.*ECI\s*05/i.test(text)) return 18;
+    if (/LASTLY,?\s*WE JUST NEED TO TAKE YOUR PAYMENT|PAYMENT DETAILS|NAME ON CARD|CARD NUMBER|PAY NOW/i.test(text)) return 16;
+    if (/SMALL CHANGE BIG CHANGE|DONATION/i.test(text)) return 15;
+    if (/PROCESS ORDER(?: AND)? PAY|CURRENT PROVIDER|\bAVC\b/i.test(text)) return 14;
+    if (/SERVICE ADDRESS|DELIVERY ADDRESS|SELF CARE PORTAL/i.test(text)) return 13;
+    if (/CONTACT DETAILS|SALUTATION|FIRST NAME/i.test(text) && !/ID VERIFICATION|LICEN[CS]E NUMBER/i.test(text)) return 12;
+    if (/checkout\/login/i.test(url) || /EMAIL ADDRESS|CHECKOUT LOGIN/i.test(text)) return 11;
+    if (/BUILD YOUR PLAN|SELECT.*NBN.*PLAN|CHOOSE.*NBN.*PLAN/i.test(text)) return 5;
+    if (/CHECK YOUR ADDRESS|ENTER.*SERVICE ADDRESS|ADDRESS SEARCH/i.test(text)) return 2;
+
+    return 0;
+  };
+
+  const checkpointAndMaybeSkip = async (step: number): Promise<boolean> => {
+    const mode = checkpoint ? await checkpoint() : "normal";
+    if (mode === "resumed") {
+      log(step, "Run resumed; re-observing the browser from its current page", { url: page.url() });
+    }
+
+    const detectedStep = await detectJourneyStep();
+    if (detectedStep > step) {
+      log(step, "Current browser page is already beyond this step; reconciling and continuing forward", {
+        detectedStep,
+        url: page.url(),
+      });
+      return true;
+    }
+
+    return false;
+  };
 
   const captchaPresent = async () => {
     const challengeFrame = page.frames().some((frame) => /recaptcha.*(bframe|challenge)|hcaptcha/i.test(frame.url()));
@@ -98,6 +138,8 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
     verified: () => Promise<boolean>;
     attempts?: number;
   }) => {
+    if (await checkpointAndMaybeSkip(args.step)) return;
+
     let reason = "postcondition not reached";
     try {
       await args.deterministic();
@@ -110,6 +152,7 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
 
     let cycle = 0;
     while (!(await args.verified())) {
+      if (await checkpointAndMaybeSkip(args.step)) return;
       cycle += 1;
       const semanticAttempts = args.attempts ?? 2;
       for (let attempt = 1; attempt <= semanticAttempts && !(await args.verified()); attempt += 1) {
@@ -262,6 +305,24 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
       done(14); log(14, "Connection details completed and next state verified");
       await runRecoverable({ step: 15, goal: "Decline the optional donation and advance to payment/order summary", deterministic: () => declineDonationAndAdvance(page), verified: async () => /name on card|payment details|card number|pay now|order summary/i.test(await bodyText()), attempts: 2 });
       done(15); log(15, "Donation declined; payment/order-summary state verified");
+
+      // Pause/resume is allowed across normal checkout pages. If the human
+      // advanced beyond Pay Now while paused, never submit payment a second time.
+      if (checkpoint) await checkpoint();
+      const resumedPaymentStep = await detectJourneyStep();
+      if (resumedPaymentStep >= 18) {
+        sensitiveMode = true;
+        log(17, "Resume detected a post-payment state; skipping payment submission to avoid a duplicate charge", {
+          detectedStep: resumedPaymentStep,
+          url: page.url(),
+        });
+        done(16);
+        done(17);
+        transactionId = await handle3dsAndTransaction(page);
+        done(18);
+        done(19);
+        return "ok";
+      }
 
       await verifyOrderSummary(page, payload);
       sensitiveMode = true;
