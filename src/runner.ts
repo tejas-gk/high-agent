@@ -127,13 +127,15 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
     step: number,
     goal: string,
     deterministic: () => Promise<void>,
-    stillOnStep: RegExp,
+    expectedNext: RegExp,
   ) => {
+    const reachedNext = async () => bodyMatches(expectedNext);
     let deterministicError: unknown;
+
     try {
       await deterministic();
       await page.waitForTimeout(500);
-      if (!(await bodyMatches(stillOnStep))) return;
+      if (await reachedNext()) return;
     } catch (error) {
       deterministicError = error;
     }
@@ -145,8 +147,8 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
         });
         if (recovered) {
           await page.waitForTimeout(500);
-          if (!(await bodyMatches(stillOnStep))) {
-            log(step, "AI recovered the changed checkout step and verified progression");
+          if (await reachedNext()) {
+            log(step, "AI recovered the changed checkout step and verified the expected next state");
             return;
           }
         }
@@ -154,22 +156,31 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
         const reason = error instanceof Error ? error.message : String(error);
         if (reason === "HUMAN_REQUIRED:CAPTCHA") {
           await humanCaptcha(step);
+          if (await reachedNext()) return;
           continue;
         }
         if (reason === "HUMAN_REQUIRED:EMAIL_OTP") {
           throw new Escalation("Email OTP appeared during checkout recovery");
         }
+
         await humanResolveEscalation(step, reason);
-        if (!(await bodyMatches(stillOnStep))) return;
-        continue;
+        if (await reachedNext()) {
+          log(step, "Human resolved escalation; expected next state verified");
+          return;
+        }
+
+        log(step, "Human handoff returned but expected next state was not reached; recovery will continue");
       }
     }
 
     const base = deterministicError instanceof Error ? deterministicError.message : String(deterministicError ?? "");
     const reason = `Could not safely complete ${goal}${base ? `: ${base}` : ""}`;
     await humanResolveEscalation(step, reason);
-    if (!(await bodyMatches(stillOnStep))) return;
-    throw new Escalation(reason);
+    if (await reachedNext()) {
+      log(step, "Human resolved final escalation; expected next state verified");
+      return;
+    }
+    throw new Escalation(`${reason}. The browser is still not on the expected next checkout state.`);
   };
 
   try {
@@ -272,7 +283,7 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
         12,
         "Complete the contact details form using only payload-backed customer values",
         () => fillContactAndAdvance(page, payload),
-        /first name|last name|date of birth|hear about us|privacy policy/i,
+        /service address|delivery address|self care portal|connection details|new connection|transfer connection/i,
       );
       done(12); log(12, "Contact details submitted; progression verified");
 
@@ -280,7 +291,7 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
         13,
         "Complete the service and delivery address step using only the supplied address",
         () => fillService(page, payload),
-        /service address|delivery address|self care portal/i,
+        /current provider|avc|new connection|transfer connection|process order|donation|small change big change/i,
       );
       done(13); log(13, "Service/delivery step submitted; progression verified");
 
@@ -288,12 +299,19 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
         14,
         "Complete connection activation/transfer details from the payload and assignment-safe defaults",
         () => fillConnection(page, payload),
-        /process order|current provider|avc|new connection|transfer connection/i,
+        /donation|small change big change|name on card|payment details|card number|pay now/i,
       );
       done(14); log(14, "Connection details submitted; progression verified");
 
       await declineDonationAndAdvance(page);
-      done(15); log(15, "Donation step cleared; validating checkout summary");
+      const reachedPaymentAfterDonation = await bodyMatches(/name on card|payment details|card number|pay now|order summary/i);
+      if (!reachedPaymentAfterDonation) {
+        await humanResolveEscalation(15, "Donation was handled, but the checkout did not reach the payment/order-summary state.");
+        if (!(await bodyMatches(/name on card|payment details|card number|pay now|order summary/i))) {
+          throw new Escalation("Donation step did not reach payment/order-summary state after human recovery");
+        }
+      }
+      done(15); log(15, "Donation step cleared; payment/order-summary state verified");
 
       await verifyOrderSummary(page, payload);
       log(15, "Order summary verified; entering guarded payment boundary");
