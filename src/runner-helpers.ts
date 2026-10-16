@@ -506,9 +506,11 @@ export async function fillConnection(
     page: Page,
     payload: JobPayload,
 ): Promise<void> {
+    // Assignment rule: a move-in date means New connection; otherwise Transfer.
+    const wantsNew = !!payload.connectionDetails.moveInDate;
     const activation = await formField(
         page,
-        payload.connectionDetails.moveInDate ? /new/i : /transfer/i,
+        wantsNew ? /new/i : /transfer/i,
         "check",
     );
     if (activation) {
@@ -521,9 +523,23 @@ export async function fillConnection(
         .locator("input[name='new_or_transfer']")
         .filter({ visible: true });
     if (await newOrTransfer.count()) {
-        const wantTransfer = !!payload.connectionDetails.moveInDate;
-        const target = wantTransfer ? newOrTransfer.last() : newOrTransfer.first();
-        await target.check({ force: true }).catch(() => undefined);
+        let matched = false;
+        for (let i = 0; i < (await newOrTransfer.count()); i += 1) {
+            const radio = newOrTransfer.nth(i);
+            const id = await radio.getAttribute("id").catch(() => null);
+            const value = (await radio.getAttribute("value").catch(() => "")) || "";
+            const label = id ? await page.locator(`label[for="${id}"]`).innerText().catch(() => "") : "";
+            const semantic = `${value} ${label}`;
+            if ((wantsNew && /\bnew\b/i.test(semantic)) || (!wantsNew && /transfer/i.test(semantic))) {
+                await radio.check({ force: true }).catch(() => undefined);
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            const target = wantsNew ? newOrTransfer.first() : newOrTransfer.last();
+            await target.check({ force: true }).catch(() => undefined);
+        }
     }
 
     if (payload.connectionDetails.avcId) {
@@ -580,15 +596,19 @@ export async function fillConnection(
         throw new Error("Process Order and Pay not found");
     }
 
-    await clickAction(process);
     let navigated = false;
-    const connDeadline = Date.now() + 8_000;
+    const connDeadline = Date.now() + 30_000;
     while (Date.now() < connDeadline && !navigated) {
-        if (!/transfer-number/i.test(page.url())) {
-            navigated = true;
-            break;
+        await clickAction(process).catch(() => undefined);
+        const sliceDeadline = Math.min(Date.now() + 5_000, connDeadline);
+        while (Date.now() < sliceDeadline) {
+            const text = await page.locator("body").innerText().catch(() => "");
+            if (!/transfer-number/i.test(page.url()) || /donation|small change big change|payment details|name on card/i.test(text)) {
+                navigated = true;
+                break;
+            }
+            await page.waitForTimeout(400);
         }
-        await page.waitForTimeout(300);
     }
 
     if (!navigated) {
