@@ -111,8 +111,8 @@ export function startJob(raw: unknown, mutate: boolean) {
             const timer = setTimeout(() => {
               humanInputs.delete(id);
               job.humanRequest = undefined;
-              reject(new Error("Human handoff timed out after 10 minutes"));
-            }, 10 * 60 * 1000);
+              reject(new Error("Human handoff timed out after 20 minutes"));
+            }, 20 * 60 * 1000);
 
             humanInputs.set(id, { resolve, reject, timer });
           }),
