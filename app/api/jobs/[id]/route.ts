@@ -15,5 +15,9 @@ export async function GET(
     return NextResponse.json({ error: "Job not found" }, { status: 404 });
   }
 
-  return NextResponse.json(job);
+  // The primary page predates the explicit paused status and only keeps
+  // polling while a job reports running/waiting. Keep its live trace polling
+  // active during a cooperative pause; the dedicated run-control overlay reads
+  // the real paused status from /api/jobs.
+  return NextResponse.json(job.status === "paused" ? { ...job, status: "running" } : job);
 }
