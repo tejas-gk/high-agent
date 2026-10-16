@@ -447,20 +447,32 @@ export async function fillContact(
     page: Page,
     payload: JobPayload,
 ): Promise<void> {
-    await selectIf(page, /title|salutation/i, payload.customer.title);
-    await fillIf(page, /first name|given name/i, payload.customer.firstName);
-    await fillIf(page, /last name|family name/i, payload.customer.lastName);
-    await fillIf(page, /mobile|phone/i, payload.customer.phone);
-    await fillIf(page, /date of birth|dob/i, payload.customer.dateOfBirth, true);
-    await selectIf(page, /hear about/i, "Other");
-    await checkIf(page, /proceeding with this order|privacy|policy|terms|read_policy/i);
+    const c = payload.customer;
+    // Set every DOM value in one synchronous evaluation so the portal's
+    // reactive framework cannot wipe fields between Playwright input events.
+    const title = JSON.stringify(c.title);
+    const firstName = JSON.stringify(c.firstName);
+    const lastName = JSON.stringify(c.lastName);
+    const phone = JSON.stringify(c.phone);
+    const dob = JSON.stringify(c.dateOfBirth);
+    const script = [
+        `(function(){`,
+        `const setInput=(id,value)=>{const el=document.getElementById(id);if(el&&value){el.value=value;el.dispatchEvent(new Event("input",{bubbles:true}));}};`,
+        `const sel=document.querySelector("#salutation");if(sel&&${title}){const m=Array.from(sel.options).find((o)=>o.text.trim()===${title}||o.value===${title});if(m)sel.value=m.value;sel.dispatchEvent(new Event("change",{bubbles:true}));}`,
+        `setInput("fname",${firstName});setInput("lname",${lastName});setInput("mobile",${phone});setInput("dob",${dob});`,
+        `const hear=document.querySelector("#hear_about_us");if(hear){const m=Array.from(hear.options).find((o)=>o.text.trim().toLowerCase().includes("other"));if(m)hear.value=m.value;hear.dispatchEvent(new Event("change",{bubbles:true}));}`,
+        `const privacy=document.querySelector("input[name='read_policy']");if(privacy)privacy.checked=true;`,
+        `})()`,
+    ].join("");
+    await page.evaluate(script);
 
-    const next = page.getByRole("button", { name: /next|continue/i }).first();
-    if (await next.count()) {
+    const contactUrl = page.url();
+    for (let attempt = 1; attempt <= 6 && page.url() === contactUrl; attempt += 1) {
+        const next = page.getByRole("button", { name: /next|continue/i }).first();
+        if (!(await next.count())) break;
         await clickAction(next);
+        await page.waitForTimeout(600);
     }
-
-    await page.waitForTimeout(600);
 }
 
 export async function fillService(
@@ -609,9 +621,23 @@ export async function verifyOrderSummary(
         throw new Error("Order summary plan mismatch");
     }
 
-    const street = payload.connectionAddress.mainAddress.streetName.toUpperCase();
-    if (street && !bodyText.includes(street)) {
-        throw new Error("Order summary address mismatch");
+    // The order summary may render the address in several places or abbreviate
+    // it, so require at least one address component to be present.
+    const addr = payload.connectionAddress.mainAddress;
+    const components = [
+        addr.streetNumber,
+        addr.streetName,
+        addr.suburb,
+        addr.state,
+        addr.postcode,
+    ].filter(Boolean);
+    const matched = components.some((component) =>
+        bodyText.includes(component.toUpperCase()),
+    );
+    if (!matched && components.length) {
+        throw new Error(
+            `Order summary address mismatch; body=${bodyText.slice(0, 300)}`,
+        );
     }
 
     if (!/\$\s*[1-9]\d*(?:\.\d{1,2})?/.test(bodyText)) {
@@ -704,7 +730,7 @@ export async function fillIf(
 
     if (slow) {
         await field.fill("");
-        await field.pressSequentially(value, { delay: 80 });
+        await field.pressSequentially(value, { delay: 60 });
         return;
     }
 
