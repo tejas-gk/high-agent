@@ -2,13 +2,21 @@ import type { Page } from "playwright";
 import type { JobPayload } from "./payload";
 import { clickAction, fillVerified } from "./runner-helpers";
 
+const NEXT_PATTERN = /^(next|continue|proceed)\b/i;
+
 async function visibleAction(page: Page, pattern: RegExp) {
   const actions = page.locator("button, a, [role='button'], input[type='submit'], input[type='button']");
-  for (let i = 0; i < (await actions.count()); i += 1) {
-    const action = actions.nth(i);
-    if (!(await action.isVisible().catch(() => false))) continue;
-    const text = `${await action.innerText().catch(() => "")} ${await action.getAttribute("value").catch(() => "")}`.trim();
-    if (pattern.test(text)) return action;
+  // Two passes: exact anchored match first, then substring — so "Proceed"
+  // (mutated Continue/Next) and "Agree and Continue" both resolve without AI.
+  for (const anchored of [true, false]) {
+    for (let i = 0; i < (await actions.count()); i += 1) {
+      const action = actions.nth(i);
+      if (!(await action.isVisible().catch(() => false))) continue;
+      if (await action.isDisabled().catch(() => false)) continue;
+      const text = `${await action.innerText().catch(() => "")} ${await action.getAttribute("value").catch(() => "")} ${await action.getAttribute("aria-label").catch(() => "")}`.trim().replace(/\s+/g, " ");
+      const hit = anchored ? pattern.test(text) : new RegExp(pattern.source.replace(/^\^/, ""), pattern.flags).test(text);
+      if (hit) return action;
+    }
   }
   return null;
 }
@@ -26,42 +34,93 @@ async function waitUntil(page: Page, predicate: () => Promise<boolean>, timeoutM
   return false;
 }
 
+/**
+ * Fill a field with real keystrokes and confirm the value stuck. The portal's
+ * inputmask/datepicker can reformat or clear programmatic values, so we type,
+ * verify, and on failure dispatch an authoritative inputmask-compatible event
+ * sequence + blur. Returns true only when the field holds the value.
+ */
+async function fillSticky(page: Page, locator: import("playwright").Locator, value: string): Promise<boolean> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await locator.click().catch(() => undefined);
+    await locator.press("ControlOrMeta+a").catch(() => undefined);
+    await locator.press("Backspace").catch(() => undefined);
+    await locator.pressSequentially(value, { delay: 40 }).catch(() => undefined);
+    await page.waitForTimeout(150);
+    if ((await locator.inputValue().catch(() => "")).trim() === value.trim()) return true;
+    await locator.fill(value).catch(() => undefined);
+    await page.waitForTimeout(150);
+    if ((await locator.inputValue().catch(() => "")).trim() === value.trim()) return true;
+  }
+  // Authoritative fallback: set + emit the events inputmask/validator listen for.
+  await locator.evaluate((el: HTMLInputElement, v: string) => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+    if (setter) setter.call(el, v); else el.value = v;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    el.dispatchEvent(new Event("blur", { bubbles: true }));
+  }, value).catch(() => undefined);
+  await page.waitForTimeout(150);
+  return (await locator.inputValue().catch(() => "")).trim() === value.trim();
+}
+
 export async function fillContactAndAdvance(page: Page, payload: JobPayload): Promise<void> {
   const c = payload.customer;
+
+  // Wait for the contact form to actually render before filling.
+  await page.locator("#fname, #salutation").first().waitFor({ state: "visible", timeout: 20_000 }).catch(() => undefined);
+
   const title = page.locator("#salutation").filter({ visible: true }).first();
   if (await title.count()) {
     const options = await title.locator("option").allTextContents();
     const match = options.find((x) => x.trim().toLowerCase() === c.title.trim().toLowerCase());
-    if (match) await title.selectOption({ label: match });
+    if (match) await title.selectOption({ label: match }).catch(() => undefined);
   }
 
   const fields: Array<[string, string]> = [["#fname", c.firstName], ["#lname", c.lastName], ["#mobile", c.phone]];
   for (const [selector, value] of fields) {
     const field = page.locator(selector).filter({ visible: true }).first();
-    if (await field.count()) await fillVerified(page, field, value, 20_000);
+    if (await field.count()) {
+      const ok = await fillSticky(page, field, value);
+      if (!ok) await fillVerified(page, field, value, 5_000).catch(() => undefined);
+    }
   }
 
   const dob = page.locator("#dob").filter({ visible: true }).first();
   if (await dob.count()) {
-    await dob.fill("").catch(() => undefined);
-    await dob.pressSequentially(c.dateOfBirth, { delay: 60 });
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (await fillSticky(page, dob, c.dateOfBirth)) break;
+      await page.waitForTimeout(300);
+    }
   }
 
   const hear = page.locator("#hear_about_us").filter({ visible: true }).first();
   if (await hear.count()) {
     const options = await hear.locator("option").allTextContents();
     const other = options.find((x) => /other/i.test(x));
-    if (other) await hear.selectOption({ label: other });
+    if (other) await hear.selectOption({ label: other }).catch(() => undefined);
   }
 
   const privacy = page.locator("input[name='read_policy']").filter({ visible: true }).first();
-  if (await privacy.count() && !(await privacy.isChecked().catch(() => false))) await privacy.check({ force: true });
+  if (await privacy.count() && !(await privacy.isChecked().catch(() => false))) await privacy.check({ force: true }).catch(() => undefined);
 
-  const next = await visibleAction(page, /^(next|continue)\b/i);
-  if (!next) throw new Error("Contact details Next control not found");
-  const before = await pageSignature(page);
-  await clickAction(next);
-  if (!(await waitUntil(page, async () => (await pageSignature(page)) !== before, 10_000))) {
+  const next = await visibleAction(page, NEXT_PATTERN);
+  if (!next) throw new Error("Contact details Next control not found (looked for Next/Continue/Proceed)");
+
+  // Re-assert the date of birth immediately before each submit: the portal's
+  // inputmask/datepicker can clear it when other fields are touched, which
+  // surfaces as "Please enter your date of birth" and blocks Next.
+  let advanced = false;
+  for (let attempt = 0; attempt < 4 && !advanced; attempt += 1) {
+    const dobNow = page.locator("#dob").filter({ visible: true }).first();
+    if ((await dobNow.count()) && (await dobNow.inputValue().catch(() => "")).trim() === "") {
+      await fillSticky(page, dobNow, c.dateOfBirth);
+    }
+    const before = await pageSignature(page);
+    await clickAction(next);
+    advanced = await waitUntil(page, async () => (await pageSignature(page)) !== before, 8_000);
+  }
+  if (!advanced) {
     throw new Error("Contact details Next did not advance; validation or portal state blocked progression");
   }
 }
@@ -111,8 +170,8 @@ export async function declineDonationAndAdvance(page: Page): Promise<void> {
   }
 
   for (let attempt = 1; attempt <= 3; attempt += 1) {
-    const next = await visibleAction(page, /^(next|continue)\b/i);
-    if (!next) throw new Error("Donation page Next control not found");
+    const next = await visibleAction(page, NEXT_PATTERN);
+    if (!next) throw new Error("Donation page Next control not found (looked for Next/Continue/Proceed)");
     await next.scrollIntoViewIfNeeded().catch(() => undefined);
     await clickAction(next);
 

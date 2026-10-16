@@ -9,11 +9,23 @@ import { declineDonationAndAdvance, fillContactAndAdvance } from "./checkout-pro
 import type { JobPayload } from "./payload";
 import { describeCompletedSteps, type HealEvent, type HumanRequestType, type RunReport, type TraceEvent } from "./types";
 import {
-  activePopupId, assertNbnPlanInCart, checkAllVisible, chooseAddressSuggestion, clickAction, clickOrderNow,
-  Escalation, fillConnection, fillManual, fillService, fillVerified,
+  activePopupId, assertNbnPlanInCart, cartBounced, checkAllVisible, chooseAddressSuggestion, clickAction,
+  clickOrderNow, Escalation, fillConnection, fillManual, fillService, fillVerified,
   handle3dsAndTransaction, resolvePopup, selectPlan, selectRouter,
   settlePopups, typeAddress, verifyOrderSummary, waitForAddressResult,
 } from "./runner-helpers";
+
+/**
+ * Thrown to abort a recoverable step when the page has entered a state that
+ * cannot be healed in place (e.g. the cart bounced to an empty home page). The
+ * caller restarts the sequence instead of escalating to a human.
+ */
+class RecoverableBail extends Error {
+  constructor(public readonly code: string) {
+    super(`Recoverable bail: ${code}`);
+    this.name = "RecoverableBail";
+  }
+}
 
 export type RunnerOptions = {
   jobId: string;
@@ -62,33 +74,45 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
   const writeReport = (report: RunReport) => fs.writeFile(path.join(evidenceDir, "report.json"), JSON.stringify(report, null, 2));
   const bodyText = async () => (await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " ");
 
+  const visibleCount = (selector: string) => page.locator(selector).filter({ visible: true }).count();
+
   // Returns the next workflow step implied by the page that is currently open.
   // This lets a paused run resume from a page the human navigated to manually,
   // rather than blindly returning to the step that originally paused.
+  //
+  // Detection is structural (specific inputs/URL) rather than raw body text,
+  // because the persistent site header/footer contain phrases like
+  // "Build your plan", "Check your address" and a "First name" newsletter
+  // field that match the old text-only rules on EVERY page — which caused the
+  // runner to think the address step was already done and skip it.
   const detectJourneyStep = async (): Promise<number> => {
     const text = (await bodyText()).toUpperCase();
     const url = page.url();
 
     if (/TRANSACTION\s*(?:ID|NUMBER)|ORDER\s*(?:CONFIRMED|NUMBER)|THANK YOU.*ORDER/i.test(text)) return 20;
     if (/3.?D SECURE|AUTHENTICATED.*ECI\s*05/i.test(text)) return 18;
-    if (/LASTLY,?\s*WE JUST NEED TO TAKE YOUR PAYMENT|PAYMENT DETAILS|NAME ON CARD|CARD NUMBER|PAY NOW/i.test(text)) return 16;
-    if (/SMALL CHANGE BIG CHANGE|DONATION/i.test(text)) return 15;
-    if (/PROCESS ORDER(?: AND)? PAY|CURRENT PROVIDER|\bAVC\b/i.test(text)) return 14;
-    if (/SERVICE ADDRESS|DELIVERY ADDRESS|SELF CARE PORTAL/i.test(text)) return 13;
-    if (/CONTACT DETAILS|SALUTATION|FIRST NAME/i.test(text) && !/ID VERIFICATION|LICEN[CS]E NUMBER/i.test(text)) return 12;
-    if (/checkout\/login/i.test(url) || /EMAIL ADDRESS|CHECKOUT LOGIN/i.test(text)) return 11;
-    if (/BUILD YOUR PLAN|SELECT.*NBN.*PLAN|CHOOSE.*NBN.*PLAN/i.test(text)) return 5;
-    if (/CHECK YOUR ADDRESS|ENTER.*SERVICE ADDRESS|ADDRESS SEARCH/i.test(text)) return 2;
 
+    if ((await visibleCount('#card_number, input[autocomplete="cc-number"], input[name*="cardnumber" i]')) > 0 ||
+      /LASTLY,?\s*WE JUST NEED TO TAKE YOUR PAYMENT|NAME ON CARD|PAYMENT DETAILS/i.test(text)) return 16;
+    if ((await visibleCount('input[name*="donation" i]')) > 0 || /SMALL CHANGE BIG CHANGE|WOULD YOU LIKE TO (?:ADD|MAKE).*DONATION/i.test(text)) return 15;
+    if ((await visibleCount('input[name="new_or_transfer"], input[name*="avc" i], select[name*="provider" i]')) > 0 ||
+      /PROCESS ORDER(?: AND)? PAY|CURRENT PROVIDER/i.test(text)) return 14;
+    if ((await visibleCount('#self_care_portal, input[name*="self_care" i]')) > 0 || /SELF CARE PORTAL|SERVICE ADDRESS|DELIVERY ADDRESS/i.test(text)) return 13;
+    if ((await visibleCount('#fname, #salutation, #dob')) > 0 || (/CONTACT DETAILS/i.test(text) && !/ID VERIFICATION|LICEN[CS]E NUMBER/i.test(text))) return 12;
+    if (/checkout\/login/i.test(url)) return 11;
+    if (/#order-speeds/i.test(url)) return 5;
+    if ((await visibleCount('#autocomplete, #autocomplete-stickysearch')) > 0) return 2;
     return 0;
   };
 
+  // Reconciliation against the live page is ONLY valid after a human paused
+  // and manually navigated the shared browser. On a normal run the steps must
+  // execute in order; otherwise header text false-positives skip real steps.
   const checkpointAndMaybeSkip = async (step: number): Promise<boolean> => {
     const mode = checkpoint ? await checkpoint() : "normal";
-    if (mode === "resumed") {
-      log(step, "Run resumed; re-observing the browser from its current page", { url: page.url() });
-    }
+    if (mode !== "resumed") return false;
 
+    log(step, "Run resumed; re-observing the browser from its current page", { url: page.url() });
     const detectedStep = await detectJourneyStep();
     if (detectedStep > step) {
       log(step, "Current browser page is already beyond this step; reconciling and continuing forward", {
@@ -97,7 +121,6 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
       });
       return true;
     }
-
     return false;
   };
 
@@ -137,8 +160,13 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
     deterministic: () => Promise<void>;
     verified: () => Promise<boolean>;
     attempts?: number;
+    bail?: () => Promise<boolean>;
   }) => {
     if (await checkpointAndMaybeSkip(args.step)) return;
+
+    const bailIfNeeded = async () => {
+      if (args.bail && (await args.bail())) throw new RecoverableBail("checkoutBounce");
+    };
 
     let reason = "postcondition not reached";
     try {
@@ -149,10 +177,12 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
       reason = error instanceof Error ? error.message : String(error);
       log(args.step, "Deterministic action failed; invoking semantic recovery", { reason });
     }
+    await bailIfNeeded();
 
     let cycle = 0;
     while (!(await args.verified())) {
       if (await checkpointAndMaybeSkip(args.step)) return;
+      await bailIfNeeded();
       cycle += 1;
       const semanticAttempts = args.attempts ?? 2;
       for (let attempt = 1; attempt <= semanticAttempts && !(await args.verified()); attempt += 1) {
@@ -186,6 +216,7 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
       }
 
       if (await args.verified()) return;
+      await bailIfNeeded();
       await humanResolveEscalation(args.step, reason);
       if (await args.verified()) {
         log(args.step, "Human recovery verified; continuing same run", { cycle });
@@ -207,8 +238,16 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
       await runRecoverable({
         step: 2, goal: "Enter the supplied service address and expose an address suggestion or manual-address path",
         deterministic: () => typeAddress(page, payload.connectionAddress.mainAddress.fullAddress),
-        verified: async () => (await page.locator(".autocomplete-suggestion:visible").count()) > 0 ||
-          (await page.locator("button:visible,a:visible,[role='button']:visible").filter({ hasText: /manual|can't find|cannot find/i }).count()) > 0,
+        verified: async () => {
+          // The "Sorry! Address Not Found" row reuses .autocomplete-suggestion
+          // but is not a selectable result — only real suggestions count.
+          const rows = page.locator(".autocomplete-suggestion:visible");
+          for (let i = 0; i < (await rows.count().catch(() => 0)); i += 1) {
+            const text = await rows.nth(i).innerText().catch(() => "");
+            if (!/sorry|not found|no results|unable to/i.test(text)) return true;
+          }
+          return (await page.locator("button:visible,a:visible,[role='button']:visible").filter({ hasText: /manual|can't find|cannot find/i }).count()) > 0;
+        },
       });
       done(2); log(2, "Service address entered and address path verified");
 
@@ -233,6 +272,7 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
         step: 5, goal: `Select exactly the requested NBN plan “${payload.plan.name}” and keep a positive cart`,
         deterministic: async () => { await selectPlan(page, payload.plan.name); await settlePopups(page); },
         verified: async () => { try { await assertNbnPlanInCart(page, payload.plan.name); return true; } catch { return false; } },
+        bail: () => cartBounced(page),
       });
       done(5); done(6); log(6, "Requested NBN plan selected; blocking dialogs cleared");
 
@@ -241,6 +281,7 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
           step: 7, goal: `Select the requested router option “${payload.addOns.router.model || "BYO Modem"}” without losing the NBN plan`,
           deterministic: async () => { await selectRouter(page, payload.addOns.router.model || "BYO Modem"); await settlePopups(page); },
           verified: async () => { try { await assertNbnPlanInCart(page, payload.plan.name); return true; } catch { return false; } },
+          bail: () => cartBounced(page),
         });
         done(7); log(7, "Router choice completed");
       }
@@ -251,6 +292,7 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
           step: 8, goal: `Restore and verify the requested NBN plan “${payload.plan.name}” in a positive cart`,
           deterministic: async () => { await selectPlan(page, payload.plan.name); await settlePopups(page); },
           verified: async () => { try { await assertNbnPlanInCart(page, payload.plan.name); return true; } catch { return false; } },
+          bail: () => cartBounced(page),
         });
       }
       done(8); log(8, "Order cart positively verified");
@@ -261,6 +303,7 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
           for (let attempt = 0; attempt < 3 && !(await checkoutReached()); attempt += 1) { await clickOrderNow(page); await page.waitForTimeout(700); }
         },
         verified: checkoutReached, attempts: 3,
+        bail: () => cartBounced(page),
       });
       done(9); done(10); log(10, "Checkout reached and cart-integrity guard passed", { url: page.url(), popupId: await activePopupId(page) });
       return true;
@@ -268,7 +311,18 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
 
     let transactionId: string | undefined;
     const runOrder = async (): Promise<"ok" | "checkoutBounce"> => {
-      if (!(await selectAndOrder())) return "checkoutBounce";
+      try {
+        if (!(await selectAndOrder())) return "checkoutBounce";
+      } catch (error) {
+        if (error instanceof RecoverableBail) {
+          log(9, "Cart bounced to an empty page; restarting the plan/router/order sequence", {
+            code: error.code,
+            url: page.url(),
+          });
+          return "checkoutBounce";
+        }
+        throw error;
+      }
 
       await runRecoverable({
         step: 11, goal: "Enter the payload email on checkout login and advance to contact details or guarded OTP/CAPTCHA",
@@ -308,8 +362,10 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
 
       // Pause/resume is allowed across normal checkout pages. If the human
       // advanced beyond Pay Now while paused, never submit payment a second time.
-      if (checkpoint) await checkpoint();
-      const resumedPaymentStep = await detectJourneyStep();
+      // The duplicate-charge guard must only trigger on an actual resume,
+      // otherwise a mis-detected normal run would silently skip payment.
+      const prePaymentMode = checkpoint ? await checkpoint() : "normal";
+      const resumedPaymentStep = prePaymentMode === "resumed" ? await detectJourneyStep() : 0;
       if (resumedPaymentStep >= 18) {
         sensitiveMode = true;
         log(17, "Resume detected a post-payment state; skipping payment submission to avoid a duplicate charge", {

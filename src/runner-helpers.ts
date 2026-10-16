@@ -7,13 +7,20 @@ import type { HealEvent } from "./types";
 export class Escalation extends Error { }
 
 export async function clickAction(locator: import("playwright").Locator): Promise<void> {
+    await locator.scrollIntoViewIfNeeded().catch(() => undefined);
+    // Normal click first so client-side validation runs; force + JS click as
+    // fallbacks for restyled/overlaid controls.
     try {
-        await locator.click({ force: true, timeout: 15000 });
+        await locator.click({ timeout: 8000 });
+        return;
+    } catch { /* fall through to force */ }
+    try {
+        await locator.click({ force: true, timeout: 8000 });
         return;
     } catch {
         await locator.evaluate((element: HTMLElement) => {
             element.scrollIntoView({ block: "center", inline: "center" });
-            element.click();
+            (element as HTMLElement).click();
         });
     }
 }
@@ -71,10 +78,7 @@ export async function typeAddress(page: Page, value: string): Promise<void> {
     for (let index = 0; index < count; index += 1) {
         const input = candidates.nth(index);
         if (!(await input.isVisible().catch(() => false))) continue;
-        await input.click().catch(() => undefined);
-        await input.fill("");
-        await input.pressSequentially(value, { delay: 80 });
-        // The address must be selected from the actual UI; typing alone is not validation.
+        await typeIntoAutocomplete(page, input, value);
         return;
     }
     const textboxes = page.getByRole("textbox");
@@ -83,11 +87,39 @@ export async function typeAddress(page: Page, value: string): Promise<void> {
         if (!(await input.isVisible().catch(() => false))) continue;
         const meta = `${await input.getAttribute("placeholder").catch(() => "")} ${await input.getAttribute("aria-label").catch(() => "")} ${await input.getAttribute("name").catch(() => "")}`;
         if (!/address|service|street|suburb|postcode/i.test(meta)) continue;
-        await input.fill("");
-        await input.pressSequentially(value, { delay: 80 });
+        await typeIntoAutocomplete(page, input, value);
         return;
     }
     throw new Error("Address search field not found");
+}
+
+/**
+ * Type into the portal's address autocomplete with REAL keystrokes and then
+ * wait for the autosuggest result. The portal listens for `keyup` (debounced
+ * 600ms) before firing its autosuggest AJAX — `fill()` sets the value
+ * programmatically without key events, so suggestions never appear. Waiting
+ * here (instead of relying on the caller's 400ms check) keeps step 2
+ * deterministic and avoids spending model calls on a timing gap.
+ */
+async function typeIntoAutocomplete(page: Page, input: import("playwright").Locator, value: string): Promise<void> {
+    await input.scrollIntoViewIfNeeded().catch(() => undefined);
+    await input.click().catch(() => undefined);
+    // Clear with real keys so stale suggestions are dismissed by the page.
+    await input.press("ControlOrMeta+a").catch(() => undefined);
+    await input.press("Backspace").catch(() => undefined);
+    await input.fill("").catch(() => undefined);
+    await input.pressSequentially(value, { delay: 60 });
+    // Debounce (600ms) + autosuggest round-trip: poll for any suggestion row.
+    const deadline = Date.now() + 10_000;
+    const rows = page.locator(
+        "#search-result .autocomplete-suggestion, #popup_search-result .autocomplete-suggestion, #search-result-sticky .autocomplete-suggestion",
+    );
+    while (Date.now() < deadline) {
+        if ((await rows.count().catch(() => 0)) > 0) return;
+        await page.waitForTimeout(300);
+    }
+    // No rows within 10s — leave the typed value in place; the caller decides
+    // (manual-address path) instead of failing here.
 }
 
 export async function chooseAddressSuggestion(page: Page, address: string): Promise<boolean> {
@@ -103,13 +135,18 @@ export async function chooseAddressSuggestion(page: Page, address: string): Prom
         return false;
     }
 
+    // The "Sorry! Address Not Found" row shares the .autocomplete-suggestion
+    // class but is not selectable — ignore it, or the fallback below would
+    // click it and the addressdetails call breaks.
+    const isSorry = (text: string) => /sorry|not found|no results|unable to/i.test(text);
     let firstVisible: import("playwright").Locator | null = null;
     const count = await suggestions.count();
     for (let i = 0; i < count; i += 1) {
         const candidate = suggestions.nth(i);
         if (!(await candidate.isVisible().catch(() => false))) continue;
-        if (!firstVisible) firstVisible = candidate;
         const text = (await candidate.innerText().catch(() => "")).trim();
+        if (isSorry(text)) continue;
+        if (!firstVisible) firstVisible = candidate;
         if (text.toLowerCase().includes(street.toLowerCase())) {
             await clickAction(candidate);
             return true;
@@ -128,31 +165,44 @@ export async function fillManual(
     page: Page,
     payload: JobPayload,
 ): Promise<void> {
+    // Manual-address modal field ids: #unitno, #streetno, #streetname,
+    // #streettype (select), #suburb, #state (select), #postcode. Street Type
+    // and State are <select>s — fill() throws on them, so selectOption is
+    // required. The submit reads "Find Address", not "Confirm".
     const address = payload.connectionAddress.mainAddress;
-    const fields: Array<[RegExp, string]> = [
+    const textFields: Array<[RegExp, string]> = [
         [/unit/i, address.unitNumber],
         [/street number/i, address.streetNumber],
         [/street name/i, address.streetName],
-        [/street type/i, address.streetType],
         [/suburb/i, address.suburb],
-        [/state/i, address.state],
         [/postcode/i, address.postcode],
     ];
-
-    for (const [label, value] of fields) {
-        if (!value) {
-            continue;
-        }
-
+    for (const [label, value] of textFields) {
+        if (!value) continue;
         const field = page.getByLabel(label).first();
         if (await field.count()) {
-            await field.fill(value);
+            await field.fill(value).catch(() => undefined);
         }
+    }
+    // Selects: match by visible label text ("WAY", "WA"); fall back to value.
+    const selectFields: Array<[RegExp, string]> = [
+        [/street type/i, address.streetType],
+        [/^state/i, address.state],
+    ];
+    for (const [label, value] of selectFields) {
+        if (!value) continue;
+        const field = page.getByLabel(label).first();
+        if (!(await field.count())) continue;
+        const options = await field.locator("option").allTextContents().catch(() => [] as string[]);
+        const exact = options.find((x) => x.trim().toLowerCase() === value.trim().toLowerCase());
+        const partial = exact ?? options.find((x) => x.toLowerCase().includes(value.toLowerCase())) ?? options.find((x) => value.toLowerCase().includes(x.toLowerCase()));
+        if (partial) await field.selectOption({ label: partial }).catch(() => undefined);
+        else await field.selectOption(value).catch(() => undefined);
     }
 
     const confirm = page
         .locator("button, a, [role='button'], input[type='submit']")
-        .filter({ hasText: /confirm/i })
+        .filter({ hasText: /find address|confirm/i })
         .first();
     if (await confirm.count()) {
         await clickAction(confirm);
@@ -314,65 +364,133 @@ export async function assertCartPositive(page: Page): Promise<void> {
 }
 
 /**
+ * A cart that was already verified positive can still "bounce": the portal
+ * drops the session back to the home page ("/") with the sticky cart reset to
+ * $0.00 (server-side cart expiry, or `/address-order` erroring out before the
+ * order is committed). There is nothing to heal on an empty home page, so the
+ * whole plan/router/order sequence has to be re-driven from scratch.
+ */
+export async function cartBounced(page: Page): Promise<boolean> {
+    if (/checkout/i.test(page.url())) return false;
+    const text = await stickyCartText(page).catch(() => "");
+    const totals = [...text.matchAll(/\$\s*(\d+(?:\.\d{1,2})?)/g)].map((m) =>
+        Number(m[1]),
+    );
+    return !(totals.length && Math.max(...totals) > 0);
+}
+
+/**
  * Click the sticky "Order Now" control. The portal then shows one of several
  * modals (BYO router warning, plan-missing alarm). Approving the BYO warning is
  * what "Agree and Continue" does - it hands off to `/checkout/login`.
  */
 export async function clickOrderNow(page: Page): Promise<void> {
-    // `#addressordernotfound` is reused for hidden "Continue" controls inside
-    // modals, so target the visible button that actually reads "Order Now".
-    const buttons = page
-        .locator("button.orderNow, #addressordernotfound")
-        .filter({ hasText: /order now/i });
-    const count = await buttons.count();
-    let target: import("playwright").Locator | null = null;
-    for (let i = 0; i < count; i += 1) {
-        const button = buttons.nth(i);
-        if (await button.isVisible().catch(() => false)) {
-            target = button;
-            break;
+    // Reaching `/checkout/login` is done by clicking the "Order Now" control in
+    // the page's order summary. `#addressordernotfound` is reused for hidden
+    // "Continue" controls inside modals, so target the visible control that
+    // reads like an order submit. The portal sometimes bounces the click to the
+    // home page ("/") before the cart is committed server-side; when that
+    // happens the plan page is restored and the click retried in place.
+    const submitText = /order now|place order|proceed to order|proceed to checkout|review your order/i;
+    const origin = page.url();
+    const onCheckout = () => /checkout/i.test(page.url());
+    const onRoot = () => {
+        try { return new URL(page.url()).pathname === "/"; } catch { return false; }
+    };
+
+    const findOrderNow = async (): Promise<import("playwright").Locator | null> => {
+        // Order-summary submit first (the control the user clicks), then the
+        // sticky cart, then any visible control whose label reads like a submit.
+        const scopes = [
+            page.locator("button.orderNow, #addressordernotfound, .order_box button, .order_box a").filter({ hasText: submitText }),
+            page.locator("#sticky-main-cart a.orderNow, #sticky-main-cart [data-btn-value]").filter({ hasText: submitText }),
+            page.locator("a.orderNow[data-btn-value], [data-btn-value].orderNow").filter({ hasText: submitText }),
+            page.locator("button, a, [role='button']").filter({ hasText: submitText }),
+        ];
+        for (const scope of scopes) {
+            const count = await scope.count().catch(() => 0);
+            for (let i = 0; i < count; i += 1) {
+                const button = scope.nth(i);
+                if (await button.isVisible().catch(() => false)) return button;
+            }
         }
-    }
-    if (!target) throw new Error("Order Now control not found");
+        return null;
+    };
 
-    await target.scrollIntoViewIfNeeded().catch(() => undefined);
-    await clickAction(target);
-
-    // Wait for the order to be committed server-side (the portal raises a modal
-    // once the cart is persisted) before following the checkout link, otherwise
-    // /checkout/login can bounce back to the home page with an empty cart.
-    let popupId: string | null = null;
-    const deadline = Date.now() + 12_000;
-    while (Date.now() < deadline) {
-        if (/checkout/i.test(page.url())) {
-            await page.waitForTimeout(800);
-            return;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+        let target = await findOrderNow();
+        const findDeadline = Date.now() + 10_000;
+        while (!target && Date.now() < findDeadline && !onCheckout()) {
+            await page.waitForTimeout(400);
+            target = await findOrderNow();
         }
-        popupId = await activePopupId(page);
-        if (popupId) break;
-        await page.waitForTimeout(400);
-    }
-    await page.waitForTimeout(2_000);
-
-    // If the router warning is up, its "Agree and Continue" link is the single
-    // genuine navigation to checkout. Click once and wait; do not re-click.
-    if (popupId && /modem|byo|router/i.test(popupId)) {
-        const checkout = page
-            .locator("#user-model .modal-sections:visible a[href*='/checkout']")
-            .first();
-        if (await checkout.count()) {
-            await Promise.all([
-                page
-                    .waitForURL(/checkout/i, { timeout: 20_000 })
-                    .catch(() => undefined),
-                checkout.click({ timeout: 6_000 }).catch(() => undefined),
-            ]);
-            await page.waitForTimeout(500);
-            return;
+        if (onCheckout()) return;
+        if (!target) {
+            // The session likely bounced to the home page; restore the plan page
+            // and retry rather than failing into semantic recovery.
+            if (onRoot()) {
+                await page.goto(origin, { waitUntil: "domcontentloaded" }).catch(() => undefined);
+                await page.waitForTimeout(1_500);
+                continue;
+            }
+            throw new Error("Order Now control not found");
         }
-    }
 
-    await settlePopups(page, 5, /^(agree and continue|continue|ok|got it|i understand)/i);
+        if (process.env.DEBUG_ORDER === "true") {
+            const html = await target.evaluate((el) => (el as HTMLElement).outerHTML.slice(0, 200)).catch(() => "");
+            console.error(`[order-now] attempt=${attempt} url=${page.url()} target=${html}`);
+        }
+
+        await target.scrollIntoViewIfNeeded().catch(() => undefined);
+        await clickAction(target);
+
+        // Wait for the order to be committed server-side (the portal raises a
+        // modal once the cart is persisted) before following the checkout link.
+        let popupId: string | null = null;
+        const deadline = Date.now() + 12_000;
+        while (Date.now() < deadline) {
+            if (onCheckout()) {
+                await page.waitForTimeout(800);
+                return;
+            }
+            popupId = await activePopupId(page);
+            if (popupId) break;
+            await page.waitForTimeout(400);
+        }
+        await page.waitForTimeout(2_000);
+        if (process.env.DEBUG_ORDER === "true") {
+            console.error(`[order-now] after click url=${page.url()} popupId=${popupId}`);
+        }
+
+        // The router/BYO/eero warning modal's "Agree and Continue" link is the
+        // single genuine navigation to checkout. Click once and wait.
+        if (popupId && /modem|byo|router|eero/i.test(popupId)) {
+            const checkout = page
+                .locator("#user-model .modal-sections:visible a[href*='/checkout']")
+                .first();
+            if (await checkout.count()) {
+                await Promise.all([
+                    page.waitForURL(/checkout/i, { timeout: 20_000 }).catch(() => undefined),
+                    checkout.click({ timeout: 6_000 }).catch(() => undefined),
+                ]);
+                await page.waitForTimeout(500);
+                return;
+            }
+        }
+
+        if (onCheckout()) return;
+
+        if (onRoot()) {
+            // Bounced to the home page after the click: restore the plan page and
+            // retry so the order can be committed on a settled session.
+            await page.goto(origin, { waitUntil: "domcontentloaded" }).catch(() => undefined);
+            await page.waitForTimeout(1_500);
+            continue;
+        }
+
+        await settlePopups(page, 5, /^(agree and continue|continue|ok|got it|i understand)/i);
+        if (onCheckout()) return;
+    }
 }
 
 
@@ -524,9 +642,14 @@ export async function fillContact(
 
     const contactUrl = page.url();
     for (let attempt = 1; attempt <= 6 && page.url() === contactUrl; attempt += 1) {
-        const next = page.getByRole("button", { name: /next|continue/i }).first();
-        if (!(await next.count())) break;
-        await clickAction(next);
+        const next = page.getByRole("button", { name: /next|continue|proceed/i }).first();
+        if ((await next.count())) {
+            await clickAction(next);
+        } else {
+            const fallback = page.locator("button, a, [role='button'], input[type='submit'], input[type='button']").filter({ hasText: /next|continue|proceed/i }).first();
+            if (!(await fallback.count())) break;
+            await clickAction(fallback);
+        }
         await page.waitForTimeout(600);
     }
 }
@@ -535,7 +658,44 @@ export async function fillService(
     page: Page,
     payload: JobPayload,
 ): Promise<void> {
-    if (payload.connectionAddress.mainAddress.streetNumber) {
+    const addr = payload.connectionAddress.mainAddress;
+    // Populate explicit service/delivery fields when the portal renders them
+    // (manual path / verification screen). Silent no-op when the address was
+    // already carried over and no fields exist.
+    const addressFills: Array<[RegExp, string, "text" | "select"]> = [
+        [/unit/i, addr.unitNumber, "text"],
+        [/street number|street no/i, addr.streetNumber, "text"],
+        [/street name/i, addr.streetName, "text"],
+        [/street type/i, addr.streetType, "text"],
+        [/suburb|city/i, addr.suburb, "text"],
+        [/state/i, addr.state, "select"],
+        [/postcode|post code|zip/i, addr.postcode, "text"],
+        [/full address|service address|delivery address|street address/i, addr.fullAddress, "text"],
+    ];
+    for (const [label, value, kind] of addressFills) {
+        if (!value) continue;
+        const field = await formField(page, label, kind === "select" ? "select" : "text");
+        if (!field) {
+            if (kind === "select") {
+                const asText = await formField(page, label, "text");
+                if (!asText) continue;
+                await asText.fill(value).catch(() => undefined);
+            }
+            continue;
+        }
+        const tag = await field.evaluate((el) => el.tagName.toLowerCase()).catch(() => "input");
+        if (tag === "select") {
+            await selectIf(page, label, value).catch(() => undefined);
+        } else {
+            await field.fill(value).catch(() => undefined);
+            const persisted = await field.inputValue().catch(() => "");
+            if (persisted.trim() !== value.trim()) {
+                await field.fill(value).catch(() => undefined);
+            }
+        }
+    }
+
+    if (addr.streetNumber) {
         const useServiceAddress = await formField(page, /use service address/i, "check");
         if (
             useServiceAddress &&
@@ -550,9 +710,13 @@ export async function fillService(
         await selfCarePortal.check().catch(() => undefined);
     }
 
-    const next = page.getByRole("button", { name: /next|continue/i }).first();
+    // Accept Next/Continue/Proceed (mutation renames Continue/Next to Proceed).
+    const next = page.getByRole("button", { name: /next|continue|proceed/i }).first();
     if (await next.count()) {
         await clickAction(next);
+    } else {
+        const fallback = page.locator("button, a, [role='button'], input[type='submit'], input[type='button']").filter({ hasText: /next|continue|proceed/i }).first();
+        if (await fallback.count()) await clickAction(fallback);
     }
 
     await page.waitForTimeout(600);
@@ -562,6 +726,10 @@ export async function fillConnection(
     page: Page,
     payload: JobPayload,
 ): Promise<void> {
+    // The connection step often opens behind a blocking "Heads up!" equipment
+    // notice whose Continue must be dismissed before the fields are usable.
+    await settlePopups(page, 5, /^(continue|ok|got it|i understand|agree and continue|close)/i);
+
     // Assignment rule: a move-in date means New connection; otherwise Transfer.
     const wantsNew = !!payload.connectionDetails.moveInDate;
     const activation = await formField(
@@ -601,15 +769,23 @@ export async function fillConnection(
     if (payload.connectionDetails.avcId) {
         await fillIf(page, /avc/i, payload.connectionDetails.avcId);
 
-        const check = page.getByRole("button", { name: /check/i }).first();
+        const check = page.locator("button, a, [role='button'], input[type='submit'], input[type='button']").filter({ hasText: /^\s*check\s*$/i }).filter({ visible: true }).first();
         if (await check.count()) {
             await clickAction(check);
         }
     } else {
-        const later = page.getByRole("button", { name: /provide later/i }).first();
+        // Payload has no AVC ID (transfer without AVC). The portal still marks
+        // the field required unless "Provide Later" is explicitly chosen; the
+        // control may be a button, link or label, so match any of them.
+        const later = page.locator("button, a, [role='button'], input[type='button'], input[type='submit'], label")
+            .filter({ hasText: /provide later/i }).filter({ visible: true }).first();
         if (await later.count()) {
             await clickAction(later);
+        } else {
+            const text = page.getByText(/provide later/i).filter({ visible: true }).first();
+            if (await text.count()) await clickAction(text);
         }
+        await page.waitForTimeout(400);
     }
 
     if (payload.connectionDetails.currentProvider) {
@@ -645,26 +821,51 @@ export async function fillConnection(
         await waitForRouter.check().catch(() => undefined);
     }
 
-    const process = page
-        .getByRole("button", { name: /process order|pay/i })
-        .first();
+    // The global header contains a "Pay Bill" nav link (`<a href=".../paybill">`)
+    // with `target="_blank"`. A loose /pay/i matcher would click that instead of
+    // the form's real "Process Order & Pay" control, so match the explicit
+    // "process order" text first and never fall back to plain links.
+    const processSpecific = page
+        .locator("button, input[type='submit'], input[type='button'], a.btn, a[role='button']")
+        .filter({ hasText: /process\s*order/i }).filter({ visible: true }).first();
+    const process = (await processSpecific.count())
+        ? processSpecific
+        : page
+            .locator("button, input[type='submit'], input[type='button'], a.btn, a[role='button']")
+            .filter({ hasText: /pay now|proceed to pay|continue to pay|^pay$/i })
+            .filter({ visible: true }).first();
     if (!(await process.count())) {
         throw new Error("Process Order and Pay not found");
     }
 
     let navigated = false;
-    const connDeadline = Date.now() + 30_000;
+    const connDeadline = Date.now() + 40_000;
+    let settledAfterClick = false;
     while (Date.now() < connDeadline && !navigated) {
+        await settlePopups(page, 3, /^(continue|ok|got it|i understand|agree and continue)/i);
         await clickAction(process).catch(() => undefined);
-        const sliceDeadline = Math.min(Date.now() + 5_000, connDeadline);
+        const sliceDeadline = Math.min(Date.now() + 6_000, connDeadline);
         while (Date.now() < sliceDeadline) {
             const text = await page.locator("body").innerText().catch(() => "");
             if (!/transfer-number/i.test(page.url()) || /donation|small change big change|payment details|name on card/i.test(text)) {
                 navigated = true;
                 break;
             }
+            // Post-submit the portal can raise a confirmation popup (e.g. an
+            // equipment/AVC notice) whose Continue must be clicked before it
+            // proceeds; settle once per click.
+            if (!settledAfterClick) {
+                settledAfterClick = true;
+                await settlePopups(page, 3, /^(continue|ok|got it|i understand|agree and continue|yes)/i).catch(() => undefined);
+            }
+            // If the AVC "12 digits" validation reappeared, re-choose Provide Later.
+            if (/must contain 12 digits/i.test(text)) {
+                const later = page.locator("button, a, [role='button'], label").filter({ hasText: /provide later/i }).filter({ visible: true }).first();
+                if (await later.count()) await clickAction(later).catch(() => undefined);
+            }
             await page.waitForTimeout(400);
         }
+        settledAfterClick = false;
     }
 
     if (!navigated) {
@@ -676,10 +877,20 @@ export async function fillConnection(
             sq24: Array.from(
                 document.querySelectorAll<HTMLInputElement>("input[name='sq24']"),
             ).map((el) => `${(el as HTMLInputElement).value}=${(el as HTMLInputElement).checked}`),
-            errors: Array.from(document.querySelectorAll<HTMLElement>("[class*='error'], .invalid-feedback, .parsley-error, .text-danger"))
+            avcValue: (document.querySelector<HTMLInputElement>("input[name*='avc' i], #avc")?.value) ?? null,
+            providerSelect: (() => {
+                const sel = document.querySelector<HTMLSelectElement>("select[name*='provider' i]");
+                return sel ? { name: sel.name, value: sel.value } : null;
+            })(),
+            provideLaterHtml: Array.from(document.querySelectorAll<HTMLElement>("a,button,label,span"))
+                .find((el) => /provide later/i.test(el.textContent || ""))?.outerHTML.slice(0, 200) ?? null,
+            checks: Array.from(document.querySelectorAll<HTMLInputElement>("input[type='checkbox']"))
+                .slice(0, 12).map((el) => `${el.name || el.id}=${el.checked}`),
+            submitDisabled: (document.querySelector<HTMLButtonElement>("button:not([disabled])")?.textContent || "").trim().slice(0, 40),
+            errors: Array.from(document.querySelectorAll<HTMLElement>("[class*='error'], .invalid-feedback, .parsley-error, .text-danger, .help-block"))
                 .filter((el) => el.offsetParent !== null && el.innerText.trim())
-                .map((el) => el.innerText.trim().slice(0, 100)),
-            visibleErrors: document.body.innerText.replace(/\s+/g, " ").slice(0, 1200),
+                .map((el) => el.innerText.trim().slice(0, 120)),
+            visibleErrors: document.body.innerText.replace(/\s+/g, " ").slice(0, 1400),
         }));
         throw new Error(
             `Process Order & Pay did not advance from connection page: ${JSON.stringify(state)}`,
@@ -697,8 +908,11 @@ export async function verifyOrderSummary(
         throw new Error("Order summary plan mismatch");
     }
 
-    // The order summary may render the address in several places or abbreviate
-    // it, so require at least one address component to be present.
+    // The address appears in the order summary only on some steps (review /
+    // address pages); the final payment page shows plan + totals but no
+    // address. Only enforce the address component when a summary address
+    // section is actually rendered, so a component can never silently vanish
+    // where it is meant to be shown.
     const addr = payload.connectionAddress.mainAddress;
     const components = [
         addr.streetNumber,
@@ -707,10 +921,11 @@ export async function verifyOrderSummary(
         addr.state,
         addr.postcode,
     ].filter(Boolean);
+    const showsAddress = /(service|delivery|installation|connection)\s+address|your\s+address/i.test(bodyText);
     const matched = components.some((component) =>
         bodyText.includes(component.toUpperCase()),
     );
-    if (!matched && components.length) {
+    if (showsAddress && !matched && components.length) {
         throw new Error(
             `Order summary address mismatch; body=${bodyText.slice(0, 300)}`,
         );
@@ -878,11 +1093,11 @@ export async function fillVerified(
 }
 
 /**
- * Resolve a visible form control by label or placeholder. Scoped to real inputs
- * so navigation links (which also carry aria-labels like "Mobile") and hidden
- * mirrored fields are ignored. `kind` narrows to the control type the caller
- * intends to act on, which keeps label collisions (e.g. "Mobile" matching a
- * hidden sim-transfer checkbox) from breaking a fill.
+ * Resolve a visible form control by label, placeholder, or surrounding text.
+ * Scoped to real inputs so navigation links and hidden mirrored fields are
+ * ignored. Falls back to scanning visible inputs' id/name/placeholder/label
+ * context, which catches portals where <label> is a sibling rather than a
+ * programmatically associated label (getByLabel/getByPlaceholder miss those).
  */
 async function formField(
     page: Page,
@@ -904,6 +1119,33 @@ async function formField(
         const byPlaceholder = page.getByPlaceholder(label).and(scoped).first();
         if (await byPlaceholder.count()) return byPlaceholder;
     }
+
+    // Fallback: match against id/name/placeholder/aria-label plus the nearest
+    // textual context (associated <label>, wrapping label, parent text).
+    // This is what makes AVC/provider/date/checkbox fills actually land.
+    try {
+        const count = await scoped.count();
+        for (let i = 0; i < count; i += 1) {
+            const meta = await scoped.nth(i).evaluate((el) => {
+                const input = el as HTMLInputElement;
+                const id = input.id || "";
+                let assoc = "";
+                if (id) {
+                    try {
+                        const l = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+                        if (l?.textContent) assoc = l.textContent;
+                    } catch { /* ignore */ }
+                }
+                const wrap = (input.closest("label")?.textContent || "").slice(0, 200);
+                const parent = (input.parentElement?.innerText || "").slice(0, 200);
+                return `${id} ${input.getAttribute("name") || ""} ${input.getAttribute("placeholder") || ""} ${input.getAttribute("aria-label") || ""} ${input.getAttribute("value") || ""} ${assoc} ${wrap} ${parent}`.replace(/\s+/g, " ");
+            }).catch(() => "");
+            // Reset lastIndex for global regexes callers may pass.
+            label.lastIndex = 0;
+            if (meta && label.test(meta)) return scoped.nth(i);
+        }
+    } catch { /* fall through to null */ }
+    label.lastIndex = 0;
 
     return null;
 }

@@ -120,7 +120,7 @@ export default function Home() {
           <button className="text-xs font-medium text-blue-600" onClick={()=>setAdvanced(!advanced)}>{advanced ? "Hide advanced JSON" : "Advanced: edit raw JSON"}</button>
           {advanced && <Textarea value={raw} onChange={(e)=>setRaw(e.target.value)} className="min-h-[360px] text-xs"/>}
           {error && <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</div>}
-          <Button onClick={run} disabled={busy || ["running","queued","waiting_for_human"].includes(status)} className="w-full"><Play className="h-4 w-4"/>{busy ? "Starting agent…" : mutate ? "Start mutated signup" : "Start signup"}</Button>
+          <Button onClick={run} disabled={busy || ["running","queued","waiting_for_human"].includes(status)} className="w-full"><Play className="h-4 w-4"/>{busy ? "Starting agent…" : mutate ? "Start mutated" : "Start"}</Button>
         </CardContent></Card>
       </div>
 

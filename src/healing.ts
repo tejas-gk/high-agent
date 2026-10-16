@@ -1,12 +1,107 @@
 import type { Locator, Page } from "playwright";
 import { chooseCandidate, planPayloadForm, type PayloadFieldKey } from "./ai";
-import { observe } from "./observe";
+import { observe, type Candidate } from "./observe";
 import type { HealEvent } from "./types";
 import type { JobPayload } from "./payload";
 
+// Resolve via the stable data-ai-id stamped at observe() time. This fixes
+// the mis-click/mis-fill bug where healing used nth(id-1) over a freshly
+// queried (differently ordered) visible list.
+function locatorFor(page: Page, candidate: Candidate): Locator {
+  if (candidate.ref) {
+    return page.locator(`[data-ai-id="${candidate.ref}"]`).first();
+  }
+  return page.locator("button:visible,a:visible,input:visible,select:visible,textarea:visible,[role=button]:visible,[role=radio]:visible,[role=checkbox]:visible").nth(candidate.id - 1);
+}
+
+async function clickStable(page: Page, candidate: Candidate): Promise<void> {
+  const locator = locatorFor(page, candidate);
+  await locator.scrollIntoViewIfNeeded().catch(() => undefined);
+  try {
+    await locator.click({ timeout: 8000 });
+    return;
+  } catch {
+    // Force / JS fallbacks: portal restyles inputs so the clickable node is
+    // often a label/wrapper; a dispatched click still toggles the control.
+    await locator.click({ timeout: 4000, force: true }).catch(() => undefined);
+    const clicked = await locator.evaluate((el: HTMLElement) => {
+      el.scrollIntoView({ block: "center" });
+      el.click();
+      return true;
+    }).catch(() => false);
+    if (!clicked) throw new Error(`Could not click candidate ${candidate.id}`);
+  }
+}
+
+async function fillControl(page: Page, candidate: Candidate, value: string): Promise<boolean> {
+  if (!value) return true;
+  const control = locatorFor(page, candidate);
+  if (!(await control.count().catch(() => 0))) return false;
+
+  if (candidate.tag === "select") {
+    const options = await control.locator("option").allTextContents().catch(() => [] as string[]);
+    const exact = options.find((x) => x.trim().toLowerCase() === value.trim().toLowerCase());
+    const partial = exact ?? options.find((x) => x.toLowerCase().includes(value.toLowerCase())) ?? options.find((x) => value.toLowerCase().includes(x.toLowerCase()));
+    if (partial) {
+      await control.selectOption({ label: partial }).catch(() => undefined);
+      return true;
+    }
+    // Value-style match (e.g. Mr/Mrs option values).
+    await control.selectOption(value).catch(() => undefined);
+    return true;
+  }
+
+  if (/radio|checkbox/i.test(candidate.type) || candidate.role === "radio" || candidate.role === "checkbox") {
+    // Radios/checkboxes carry no free text: presence of an assignment means
+    // "select this option" (activation New/Transfer, Unsure, Wait-for-router).
+    await control.check({ force: true }).catch(() => undefined);
+    if (await control.isChecked().catch(() => false)) return true;
+    await clickStable(page, candidate).catch(() => undefined);
+    return control.isChecked().catch(() => false);
+  }
+
+  // Text-like input: REAL keystrokes first. The portal's address search (and
+  // other validated fields) listens for `keyup` (debounced) — `fill()` sets
+  // the value programmatically with no key events, so autosuggest never fires
+  // and AI recovery would type an address no suggestion ever matches.
+  await control.scrollIntoViewIfNeeded().catch(() => undefined);
+  await control.click().catch(() => undefined);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await control.press("ControlOrMeta+a").catch(() => undefined);
+    await control.press("Backspace").catch(() => undefined);
+    await control.pressSequentially(value, { delay: 30 }).catch(() => undefined);
+    const persisted = await control.inputValue().catch(() => "");
+    if (persisted.trim() === value.trim()) return true;
+    await page.waitForTimeout(200);
+  }
+  // Fallback for inputs that reject keystrokes: programmatic fill + synthetic
+  // keyup/input/change (bubbled, so delegated jQuery handlers still run).
+  await control.fill(value).catch(() => undefined);
+  await control.evaluate((el: HTMLInputElement) => {
+    el.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true }));
+    el.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, cancelable: true }));
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  }).catch(() => undefined);
+  const final = await control.inputValue().catch(() => "");
+  if (final.trim() === value.trim()) return true;
+  // Last resort: set via DOM + dispatch input/change so framework picks it up.
+  await control.evaluate((el: HTMLInputElement, v: string) => {
+    el.focus();
+    el.value = v;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  }, value).catch(() => undefined);
+  const last = await control.inputValue().catch(() => "");
+  return last.trim() === value.trim();
+}
+
 export async function semanticLocator(page: Page, args: { step: number; intent: string; names: string[]; guarded?: boolean; modelBudget: { used: number; max: number } }): Promise<{ locator: Locator; heal?: HealEvent }> {
   if (args.guarded) throw new Error("Guarded step cannot use free-form healing");
-  for (const n of args.names) {
+  // Treat "Proceed" as the renamed Continue/Next so mutated UI still matches
+  // without spending a model call.
+  const names = args.names.flatMap((n) => (/^(next|continue)$/i.test(n.trim()) ? [n, "Proceed"] : [n]));
+  for (const n of names) {
     const byText = page.locator("button, a, [role='button'], input[type='submit'], input[type='button']").filter({ hasText: new RegExp(escapeRx(n), "i") });
     for (let index = 0; index < (await byText.count()); index += 1) {
       const candidate = byText.nth(index);
@@ -22,8 +117,7 @@ export async function semanticLocator(page: Page, args: { step: number; intent: 
   if (!choice || choice.confidence < 0.7) throw new Error("No high-confidence semantic recovery");
   const c = o.candidates.find((x) => x.id === choice.candidateId);
   if (!c) throw new Error("AI selected unknown candidate");
-  const interactive = page.locator("button:visible,a:visible,input:visible,select:visible,textarea:visible,[role=button]:visible,[role=radio]:visible,[role=checkbox]:visible").nth(choice.candidateId - 1);
-  return { locator: interactive, heal: { step: args.step, level: "L2", intent: args.intent, reason: choice.reason, newLocator: `candidate:${choice.candidateId}`, confidence: choice.confidence, evidence: JSON.stringify(c), verified: false } };
+  return { locator: locatorFor(page, c), heal: { step: args.step, level: "L2", intent: args.intent, reason: choice.reason, newLocator: `candidate:${choice.candidateId}`, confidence: choice.confidence, evidence: JSON.stringify(c), verified: false } };
 }
 
 export async function recoverUnexpectedPage(page: Page, args: { step: number; goal: string; expected?: string; payload: JobPayload; modelBudget: { used: number; max: number }; heals: HealEvent[] }): Promise<boolean> {
@@ -36,8 +130,9 @@ export async function recoverUnexpectedPage(page: Page, args: { step: number; go
   if (/card number|cvv|pay now|payment details/i.test(pageText)) throw new Error("Guarded payment state encountered during free-form recovery");
   if (args.modelBudget.used >= args.modelBudget.max) throw new Error("Model-call budget exhausted");
 
-  const visibleInputs = observation.candidates.filter((candidate) => ["input", "select", "textarea"].includes(candidate.tag) && candidate.type !== "hidden");
+  const visibleInputs = observation.candidates.filter((candidate) => ["input", "select", "textarea"].includes(candidate.tag) && candidate.type !== "hidden" && !candidate.disabled);
   const safeActions = observation.candidates.filter((candidate) =>
+    !candidate.disabled &&
     (candidate.tag === "button" || candidate.tag === "a" || candidate.role === "button") &&
     !/pay|purchase|submit order|place order|otp|verify code|captcha|donation|agree|consent/i.test(`${candidate.text} ${candidate.name} ${candidate.label}`)
   );
@@ -70,44 +165,40 @@ export async function recoverUnexpectedPage(page: Page, args: { step: number; go
     return map[key] ?? "";
   };
 
+  // ONE model call covers both fills + the follow-up nav action. The old code
+  // spent a second call on chooseCandidate even when the form plan already
+  // contained an action — doubling token/request cost per recovery.
   if (visibleInputs.length) {
     args.modelBudget.used++;
     const plan = await planPayloadForm({ goal: args.goal, observation, candidates: [...visibleInputs, ...safeActions] });
-    if (plan && plan.confidence >= 0.72) {
+    if (plan && plan.confidence >= 0.6) {
+      let filled = 0;
       for (const assignment of plan.assignments) {
         const value = valueFor(assignment.valueKey);
         if (!value) continue;
         const candidate = observation.candidates.find((x) => x.id === assignment.candidateId);
         if (!candidate || !["input", "select", "textarea"].includes(candidate.tag)) continue;
-        const control = page.locator("button:visible,a:visible,input:visible,select:visible,textarea:visible,[role=button]:visible,[role=radio]:visible,[role=checkbox]:visible").nth(candidate.id - 1);
-        if (candidate.tag === "select") {
-          const options = await control.locator("option").allTextContents().catch(() => []);
-          const exact = options.find((x) => x.trim().toLowerCase() === value.trim().toLowerCase());
-          const partial = exact ?? options.find((x) => x.toLowerCase().includes(value.toLowerCase()));
-          if (partial) await control.selectOption({ label: partial }).catch(() => undefined);
-        } else if (/radio|checkbox/i.test(candidate.type) || candidate.role === "radio" || candidate.role === "checkbox") {
-          await control.check({ force: true }).catch(() => undefined);
-        } else {
-          await control.fill(value).catch(() => undefined);
-          const persisted = await control.inputValue().catch(() => "");
-          if (persisted.trim() !== value.trim()) await control.fill(value).catch(() => undefined);
-        }
+        if (await fillControl(page, candidate, value)) filled += 1;
       }
 
       if (plan.actionCandidateId) {
         const action = observation.candidates.find((x) => x.id === plan.actionCandidateId);
         if (action && safeActions.some((x) => x.id === action.id)) {
           const before = `${page.url()}|${observation.headings.join("|")}|${observation.bodyText.slice(0, 300)}`;
-          const locator = page.locator("button:visible,a:visible,input:visible,select:visible,textarea:visible,[role=button]:visible,[role=radio]:visible,[role=checkbox]:visible").nth(action.id - 1);
-          await locator.scrollIntoViewIfNeeded().catch(() => undefined);
-          await locator.click({ timeout: 10_000 }).catch(async () => { await locator.evaluate((element: HTMLElement) => element.click()); });
+          await clickStable(page, action);
           await page.waitForTimeout(800);
           const afterObservation = await observe(page);
           const reachedExpected = args.expected ? (await page.locator(args.expected).filter({ visible: true }).count()) > 0 : false;
           const changed = before !== `${page.url()}|${afterObservation.headings.join("|")}|${afterObservation.bodyText.slice(0, 300)}`;
-          args.heals.push({ step: args.step, level: "L3", intent: args.goal, reason: plan.reason, newLocator: `form-plan/action:${action.id}`, confidence: plan.confidence, evidence: `Mapped ${plan.assignments.length} payload-backed field(s); action=${action.text || action.name || action.label}`, verified: reachedExpected || changed });
+          args.heals.push({ step: args.step, level: "L3", intent: args.goal, reason: plan.reason, newLocator: `form-plan/action:${action.id}`, confidence: plan.confidence, evidence: `Mapped ${filled}/${plan.assignments.length} payload-backed field(s); action=${action.text || action.name || action.label}`, verified: reachedExpected || changed });
           if (reachedExpected || changed) return true;
+          // Fills stuck but nav happened — report progress so the caller can
+          // re-verify instead of spending another model call immediately.
+          if (filled > 0) return true;
         }
+      } else if (filled > 0) {
+        args.heals.push({ step: args.step, level: "L3", intent: args.goal, reason: plan.reason, newLocator: `form-plan/fills:${filled}`, confidence: plan.confidence, evidence: `Filled ${filled} payload-backed field(s), no nav action`, verified: false });
+        return true;
       }
     }
   }
@@ -120,13 +211,11 @@ export async function recoverUnexpectedPage(page: Page, args: { step: number; go
       observation,
       candidates: safeActions,
     });
-    if (choice && choice.confidence >= 0.75) {
+    if (choice && choice.confidence >= 0.7) {
       const selected = safeActions.find((candidate) => candidate.id === choice.candidateId);
       if (selected) {
         const before = `${page.url()}|${observation.headings.join("|")}|${observation.bodyText.slice(0, 300)}`;
-        const interactive = page.locator("button:visible,a:visible,input:visible,select:visible,textarea:visible,[role=button]:visible,[role=radio]:visible,[role=checkbox]:visible").nth(selected.id - 1);
-        await interactive.scrollIntoViewIfNeeded().catch(() => undefined);
-        await interactive.click({ timeout: 10_000 }).catch(async () => { await interactive.evaluate((element: HTMLElement) => element.click()); });
+        await clickStable(page, selected);
         await page.waitForTimeout(700);
         const afterObservation = await observe(page);
         const after = `${page.url()}|${afterObservation.headings.join("|")}|${afterObservation.bodyText.slice(0, 300)}`;

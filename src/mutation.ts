@@ -1,8 +1,20 @@
 import type { Page } from "playwright";
 
 export async function installMutationLayer(page: Page): Promise<void> {
+  // NOTE: the injected callback must avoid named function bindings. tsx/esbuild
+  // (keepNames) rewrites `const apply = () => {}` to reference an undefined
+  // `__name` inside the page. Passing the logic as an anonymous IIFE argument
+  // keeps it reusable without a named binding.
   await page.addInitScript(() => {
-    const apply = () => {
+    ((apply: () => void) => {
+      new MutationObserver(apply).observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+      });
+
+      window.addEventListener("load", apply);
+      setTimeout(apply, 1200);
+    })(() => {
       const buttons = Array.from(document.querySelectorAll("button"));
       const target = buttons.find((button) =>
         /build your plan|order now|next|continue/i.test(
@@ -49,14 +61,6 @@ export async function installMutationLayer(page: Page): Promise<void> {
           ?.addEventListener("click", () => popup.remove());
         document.body.appendChild(popup);
       }
-    };
-
-    new MutationObserver(apply).observe(document.documentElement, {
-      childList: true,
-      subtree: true,
     });
-
-    window.addEventListener("load", apply);
-    setTimeout(apply, 1200);
   });
 }
