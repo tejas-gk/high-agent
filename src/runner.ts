@@ -80,6 +80,20 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
     log(step, "CAPTCHA cleared by human; agent resumed the same browser session");
   };
 
+
+  const humanResolveEscalation = async (step: number, reason: string) => {
+    if (!requestHumanInput) throw new Escalation(reason);
+    log(step, "Human handoff: recoverable escalation; browser session preserved", { reason });
+    await capturePreview();
+    await requestHumanInput({
+      type: "MANUAL_ESCALATION",
+      step,
+      message: `The agent could not safely continue automatically: ${reason}. Resolve the issue directly in the open Tangerine browser without closing it, then click “I resolved it — continue”. The agent will re-observe the same session and continue from the current page.`,
+    });
+    await page.waitForTimeout(500);
+    log(step, "Manual escalation marked resolved; re-observing current browser state");
+  };
+
   const ensureExpectedState = async (step: number, goal: string, selector: string) => {
     if (await page.locator(selector).filter({ visible: true }).count()) return;
     for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -97,7 +111,9 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
           continue;
         }
         if (reason === "HUMAN_REQUIRED:EMAIL_OTP") throw new Escalation("Email OTP appeared outside the guarded checkout handoff");
-        throw new Escalation(reason);
+        await humanResolveEscalation(step, reason);
+        if (await page.locator(selector).filter({ visible: true }).count()) return;
+        continue;
       }
     }
     throw new Escalation(`Could not safely reach expected state: ${goal}`);
@@ -143,12 +159,17 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
         if (reason === "HUMAN_REQUIRED:EMAIL_OTP") {
           throw new Escalation("Email OTP appeared during checkout recovery");
         }
-        throw new Escalation(reason);
+        await humanResolveEscalation(step, reason);
+        if (!(await bodyMatches(stillOnStep))) return;
+        continue;
       }
     }
 
     const base = deterministicError instanceof Error ? deterministicError.message : String(deterministicError ?? "");
-    throw new Escalation(`Could not safely complete ${goal}${base ? `: ${base}` : ""}`);
+    const reason = `Could not safely complete ${goal}${base ? `: ${base}` : ""}`;
+    await humanResolveEscalation(step, reason);
+    if (!(await bodyMatches(stillOnStep))) return;
+    throw new Escalation(reason);
   };
 
   try {
@@ -281,8 +302,15 @@ export async function runAgent({ jobId, payload, mutate, emit, requestHumanInput
       log(16, "Payment fields filled by isolated executor", { last4: payResult.last4 });
       await checkAllVisible(page);
       const pay = page.locator("button, a, [role='button'], input[type='submit'], input[type='button']").filter({ hasText: /pay now/i }).first();
-      if (!(await pay.count())) throw new Escalation("Final Pay Now control missing; guarded step will not heal");
-      await clickAction(pay); done(16);
+      if (!(await pay.count())) {
+        await humanResolveEscalation(16, "Final Pay Now control is missing. Resolve only the page/UI issue manually; do not submit payment yourself.");
+        const retryPay = page.locator("button, a, [role='button'], input[type='submit'], input[type='button']").filter({ hasText: /pay now/i }).first();
+        if (!(await retryPay.count())) throw new Escalation("Final Pay Now control still missing after human recovery");
+        await clickAction(retryPay); done(16);
+      } else {
+        await clickAction(pay); done(16);
+      }
+
 
       const modal = page.getByRole("dialog").first();
       if (await modal.count()) {
