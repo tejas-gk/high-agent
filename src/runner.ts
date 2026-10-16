@@ -44,6 +44,9 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
   const evidenceDir = path.resolve("artifacts", jobId);
   const previewPath = path.join(evidenceDir, "live.png");
   let sensitiveMode = false;
+  // Once the agent has parked at the payment page the browser must survive the
+  // run: the human completes the payment in that exact window.
+  let keepBrowserOpen = false;
   await fs.mkdir(evidenceDir, { recursive: true });
 
   const browser = await chromium.launch({ headless: process.env.HEADLESS === "true" });
@@ -226,6 +229,42 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
     }
   };
 
+  /**
+   * Park at the payment page and wait for the human to finish paying. The agent
+   * never touches card fields, never closes the browser and only reads the page
+   * to notice the order confirmation.
+   */
+  const waitForHumanPayment = async (step: number) => {
+    const timeoutMs = Number(process.env.PAYMENT_WAIT_MS || 900_000);
+    const deadline = Date.now() + timeoutMs;
+    let announced = false;
+    const confirmed = async () => {
+      if (/order-done|order_done|order\/confirmation/i.test(page.url())) return true;
+      const text = (await bodyText()).toLowerCase();
+      return /order (has been|was|is) (placed|confirmed|successful)|thank you for your order|we have received your order|your order (is )?confirmed|order confirmation/i.test(text);
+    };
+    while (Date.now() < deadline) {
+      if (await confirmed()) {
+        // Payment landed; the browser is no longer needed unless explicitly asked
+        // to stay open for inspection.
+        keepBrowserOpen = process.env.KEEP_BROWSER_OPEN === "true";
+        log(step, "Human payment detected; order confirmation reached", { url: page.url() });
+        return;
+      }
+      if (!announced && requestHumanInput) {
+        announced = true;
+        await requestHumanInput({
+          type: "PAYMENT", step,
+          message: "The agent has stopped at the payment page and left the browser open. Enter your card details and click Pay Now yourself, then confirm here. The agent will not touch your card and will not close the browser.",
+        });
+      }
+      await page.waitForTimeout(2_000);
+    }
+    throw new Escalation(
+      "Payment was not completed by the human before the wait window expired; the browser session was left open on the payment page",
+    );
+  };
+
   const checkoutReached = async () => /checkout|login/i.test(page.url()) ||
     (await page.locator('#email, input[type="email"], input[name*="email" i]').filter({ visible: true }).count()) > 0;
 
@@ -382,6 +421,44 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
 
       await verifyOrderSummary(page, payload);
       sensitiveMode = true;
+
+      // Payment is deliberately human-only by default. The agent stops here,
+      // leaves the browser open on the payment page, and watches for the order
+      // confirmation. Set AUTO_PAY=true to restore the old behaviour of filling
+      // the vault card and clicking Pay Now unattended.
+      if (process.env.AUTO_PAY !== "true") {
+        keepBrowserOpen = true;
+        const nameOnCard = page.getByLabel(/name on card/i).first();
+        if (await nameOnCard.count()) {
+          await nameOnCard.fill(payload.payment.nameOnCard).catch(() => undefined);
+        }
+        done(16);
+        done(17);
+        log(16, "Payment step reached. The agent has stopped and is waiting for the human to complete payment in the open browser", {
+          url: page.url(),
+        });
+        await waitForHumanPayment(16);
+        // The order is already confirmed by the human at this point. A
+        // confirmation page without a scrapable transaction id must not turn a
+        // completed payment into a failed run.
+        try {
+          transactionId = await handle3dsAndTransaction(page);
+        } catch (error) {
+          log(18, "Order confirmed by the human; no transaction id could be scraped from the confirmation page", {
+            reason: error instanceof Error ? error.message : String(error),
+            url: page.url(),
+          });
+        }
+        if (!/payment|card number|security code|cvv/i.test(await bodyText())) {
+          sensitiveMode = false;
+          await page.screenshot({ path: path.join(evidenceDir, "payment-confirmed.png"), fullPage: true }).catch(() => undefined);
+          sensitiveMode = true;
+        }
+        done(18);
+        done(19);
+        return "ok";
+      }
+
       const payResult = await executePayment(page, { jobId, cardRef: payload.payment.cardRef, nameOnCard: payload.payment.nameOnCard });
       log(16, "Payment fields filled by isolated executor", { last4: payResult.last4 });
       await checkAllVisible(page);
@@ -427,7 +504,14 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
     if (!sensitiveMode) await page.screenshot({ path: path.join(evidenceDir, "failure.png"), fullPage: true }).catch(() => undefined);
     await writeReport(report); await leakScan(evidenceDir); return report;
   } finally {
-    await context.close().catch(() => undefined);
-    await browser.close().catch(() => undefined);
+    if (keepBrowserOpen) {
+      // Intentionally left running: the human is paying in this window.
+      if (process.env.PAYMENT_KEEP_OPEN_LOG !== "true") {
+        console.error(`[payment] Browser left open on ${page.url()} for manual payment`);
+      }
+    } else {
+      await context.close().catch(() => undefined);
+      await browser.close().catch(() => undefined);
+    }
   }
 }

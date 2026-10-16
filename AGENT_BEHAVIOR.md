@@ -16,7 +16,11 @@ Email OTP pauses the run with `waiting_for_human`. The same Playwright browser/c
 CAPTCHA and other guarded states are not free-form healed.
 
 ## Payment boundary
-The AI never receives PAN/CVV or payment DOM values. `cardRef` is resolved only inside the deterministic payment executor. Live preview capture is disabled before payment fields are populated and failure screenshots remain disabled while sensitive payment mode is active. The final transaction screenshot is captured only after payment UI is gone.
+Payment is human-only by default. When the order summary is verified the agent stops on the payment page, fills only the non-sensitive `name on card` value, leaves the browser open, and polls (without touching any card field) until the order confirmation appears. It raises a `PAYMENT` human request so the UI shows an "I resolved it — continue" button instead of an OTP box. The browser is not closed while the human is paying.
+
+Set `AUTO_PAY=true` to restore the unattended vault-card executor. Related env vars: `PAYMENT_WAIT_MS` (default 900000) caps how long the agent waits at the payment page, `KEEP_BROWSER_OPEN=true` leaves the browser running even after a successful payment.
+
+The AI never receives PAN/CVV or payment DOM values. `cardRef` is resolved only inside the deterministic payment executor and only when `AUTO_PAY=true`. Live preview capture is disabled before payment fields are populated and failure screenshots remain disabled while sensitive payment mode is active. The final transaction screenshot is captured only after payment UI is gone.
 
 ## Mutation demo
 Mutation mode changes only the DOM inside the isolated Playwright browser session. It does not modify the Tangerine server or upstream website. The controlled mutation changes safe non-payment UI details so the recovery ladder can demonstrate resilience.

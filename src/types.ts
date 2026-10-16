@@ -7,7 +7,7 @@ export type RunStatus =
   | "failed"
   | "escalated";
 
-export type HumanRequestType = "EMAIL_OTP" | "CAPTCHA" | "THREE_DS" | "MANUAL_ESCALATION";
+export type HumanRequestType = "EMAIL_OTP" | "CAPTCHA" | "THREE_DS" | "MANUAL_ESCALATION" | "PAYMENT";
 
 export type HumanRequest = {
   type: HumanRequestType;

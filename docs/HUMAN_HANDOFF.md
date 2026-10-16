@@ -10,4 +10,4 @@ When the job status changes to `waiting_for_human`, the browser has **not** been
 
 If the OTP is rejected, the runner escalates rather than guessing or repeatedly submitting values. A pending handoff expires after 10 minutes.
 
-CAPTCHA is a stop/handoff condition. Payment remains a deterministic guarded executor and is not delegated to the AI recovery layer.
+CAPTCHA is a stop/handoff condition. Payment is also a stop/handoff condition by default: the agent parks on the payment page, never touches card fields, leaves the browser open, and waits for the human to pay. Unattended vault-card payment is opt-in via `AUTO_PAY=true`.
