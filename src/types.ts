@@ -2,6 +2,7 @@ export type RunStatus =
   | "queued"
   | "running"
   | "waiting_for_human"
+  | "paused"
   | "success"
   | "failed"
   | "escalated";
