@@ -77,6 +77,16 @@ export async function typeAddress(page: Page, value: string): Promise<void> {
         // The address must be selected from the actual UI; typing alone is not validation.
         return;
     }
+    const textboxes = page.getByRole("textbox");
+    for (let index = 0; index < (await textboxes.count()); index += 1) {
+        const input = textboxes.nth(index);
+        if (!(await input.isVisible().catch(() => false))) continue;
+        const meta = `${await input.getAttribute("placeholder").catch(() => "")} ${await input.getAttribute("aria-label").catch(() => "")} ${await input.getAttribute("name").catch(() => "")}`;
+        if (!/address|service|street|suburb|postcode/i.test(meta)) continue;
+        await input.fill("");
+        await input.pressSequentially(value, { delay: 80 });
+        return;
+    }
     throw new Error("Address search field not found");
 }
 
@@ -220,6 +230,14 @@ export async function selectPlan(page: Page, name: string): Promise<void> {
         }
     }
 
+    if (!target) {
+        const label = page.getByText(new RegExp(escapeRx(name), "i")).filter({ visible: true }).first();
+        if (await label.count()) {
+            const container = label.locator("xpath=ancestor::*[self::article or self::section or self::div][.//button or .//*[@role='button']][1]");
+            const choose = container.locator("button,[role='button'],a").filter({ visible: true }).filter({ hasText: /select|choose|add|plan/i }).first();
+            if (await choose.count()) target = choose;
+        }
+    }
     if (!target) throw new Error(`Plan card not found: ${name}`);
 
     await target.scrollIntoViewIfNeeded().catch(() => undefined);
@@ -266,9 +284,18 @@ export async function selectRouter(page: Page, model: string): Promise<void> {
         .filter({ hasText: new RegExp(escapeRx(model), "i") })
         .first()
         .or(page.getByText(new RegExp(escapeRx(model), "i")).first());
-    if (!(await item.count())) throw new Error(`Router option not found: ${model}`);
-    await item.scrollIntoViewIfNeeded().catch(() => undefined);
-    await clickAction(item);
+    let routerTarget = item;
+    if (!(await routerTarget.count())) {
+        const label = page.getByText(new RegExp(escapeRx(model), "i")).filter({ visible: true }).first();
+        if (await label.count()) {
+            const container = label.locator("xpath=ancestor::*[self::article or self::section or self::div][.//button or .//*[@role='button']][1]");
+            const choose = container.locator("button,[role='button'],a").filter({ visible: true }).filter({ hasText: /select|choose|add|outright|bring your own|byo/i }).first();
+            if (await choose.count()) routerTarget = choose;
+        }
+    }
+    if (!(await routerTarget.count())) throw new Error(`Router option not found: ${model}`);
+    await routerTarget.scrollIntoViewIfNeeded().catch(() => undefined);
+    await clickAction(routerTarget);
     await page.waitForTimeout(1200);
     await settlePopups(page);
 }
@@ -385,6 +412,10 @@ export async function resolvePopup(
     if (!id || id === "modal-loader") return null;
 
     const section = page.locator(`#user-model #${id}`).first();
+    const sectionText = await section.innerText().catch(() => "");
+    if (/hold\s*on/i.test(`${id} ${sectionText}`) && /modem|router|plan/i.test(sectionText)) {
+        throw new Error("Cart integrity alarm: modem/router present without a valid NBN plan");
+    }
     const actions = section.locator("button, a.btn, a[role='button']");
     const count = await actions.count();
 
