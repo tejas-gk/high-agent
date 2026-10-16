@@ -4,6 +4,13 @@ import { normalisePayload } from "../src/payload";
 import { runAgent } from "../src/runner";
 
 async function main() {
+    // Load .env for CLI runs (Next.js does this automatically for the UI).
+    try {
+        process.loadEnvFile();
+    } catch {
+        // No .env present; fall back to the ambient environment.
+    }
+
     const file = process.argv[2] ?? "payload.example.json";
     const mutate = process.argv.includes("--mutate");
     const raw = JSON.parse(await fs.readFile(file, "utf8"));

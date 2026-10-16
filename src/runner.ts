@@ -9,23 +9,28 @@ import { leakScan } from "./security";
 import type { JobPayload } from "./payload";
 import type { HealEvent, RunReport, TraceEvent } from "./types";
 import {
-  assertCartPositive,
+  activePopupId,
   assertNbnPlanInCart,
-  chooseAddressSuggestion,
   checkAllVisible,
+  chooseAddressSuggestion,
   clickAction,
-  dismissDialogs,
+  clickOrderNow,
   Escalation,
   fillConnection,
   fillContact,
   fillManual,
   fillService,
+  fillVerified,
   findAction,
   handle3dsAndTransaction,
+  resolvePopup,
   selectPlan,
   selectRouter,
+  settlePopups,
   typeAddress,
   verifyOrderSummary,
+  waitForAddressResult,
+  waitForPlanInCart,
 } from "./runner-helpers";
 
 export type RunnerOptions = {
@@ -54,11 +59,20 @@ export async function runAgent({
     headless: process.env.HEADLESS !== "false",
   });
   const context = await browser.newContext();
-  const page = await context.newPage();
+  let page = await context.newPage();
 
   if (mutate) {
     await installMutationLayer(page);
   }
+
+  const resetSession = async () => {
+    await page.close().catch(() => undefined);
+    await context.clearCookies().catch(() => undefined);
+    page = await context.newPage();
+    if (mutate) {
+      await installMutationLayer(page);
+    }
+  };
 
   const capturePreview = async () => {
     try {
@@ -137,90 +151,144 @@ export async function runAgent({
     done(1);
     log(1, "Portal opened");
 
-    await typeAddress(page, payload.connectionAddress.mainAddress.fullAddress);
-    done(2);
-    log(2, "Address entered");
+    const selectAndOrder = async (): Promise<boolean> => {
+      await typeAddress(page, payload.connectionAddress.mainAddress.fullAddress);
+      done(2);
+      log(2, "Address entered");
 
-    const selected = await chooseAddressSuggestion(
-      page,
-      payload.connectionAddress.mainAddress.fullAddress,
-    );
-    if (!selected) {
-      const manual = page.locator("button, a, [role='button']").filter({
-        hasText: /enter.*address.*manually|check your address manually|can't find your address/i,
-      }).first();
-      if (!(await manual.isVisible().catch(() => false))) {
-        throw new Escalation("Address suggestion unavailable; manual address path not found");
-      }
-      await clickAction(manual);
-      await fillManual(page, payload);
-    }
-
-    done(3);
-    await dismissDialogs(page);
-
-    const build = await findAction(page, {
-      step: 4,
-      intent: "Build the NBN plan after confirming the address",
-      names: ["Build Your Plan", "See plans", "available plans"],
-      modelBudget,
-      heals,
-    });
-    await clickAction(build);
-    await page.waitForTimeout(1200);
-    done(4);
-
-    await selectPlan(page, payload.plan.name);
-    await assertNbnPlanInCart(page, payload.plan.name);
-    done(5);
-    await dismissDialogs(page);
-    done(6);
-
-    if (payload.addOns.router.enabled) {
-      await selectRouter(page, payload.addOns.router.model || "BYO Modem");
-      await assertNbnPlanInCart(page, payload.plan.name);
-      done(7);
-    }
-
-    await assertNbnPlanInCart(page, payload.plan.name);
-    done(8);
-
-    const order = await findAction(page, {
-      step: 9,
-      intent: "Continue from selected NBN plan to checkout",
-      names: ["Order Now", "Continue", "Checkout"],
-      modelBudget,
-      heals,
-    });
-    await clickAction(order);
-    await page.waitForTimeout(1000);
-
-    if (await page.getByText(/hold on/i).count()) {
-      throw new Error(
-        "Cart integrity alarm: router present without active plan",
+      const selected = await chooseAddressSuggestion(
+        page,
+        payload.connectionAddress.mainAddress.fullAddress,
       );
+      if (!selected) {
+        const manual = page
+          .locator("button, a, [role='button']")
+          .filter({
+            hasText:
+              /enter.*address.*manually|check your address manually|can't find your address/i,
+          })
+          .first();
+        if (!(await manual.isVisible().catch(() => false))) {
+          throw new Escalation("Address suggestion unavailable; manual address path not found");
+        }
+        await clickAction(manual);
+        await fillManual(page, payload);
+      }
+
+      // The portal runs an address check behind a "Hold tight!" spinner and then
+      // raises a result modal. Wait for it, then confirm the tech type.
+      await waitForAddressResult(page);
+      const techResult = await resolvePopup(
+        page,
+        /build your plan|see nbn|see other plans|continue with nbn|pre-?order/i,
+      );
+      done(3);
+      log(3, "Address confirmed", { techResult });
+
+      await settlePopups(page);
+      done(4);
+
+      // Plan + optional router must both survive in the sticky cart. The portal
+      // has a known bug where selecting a modem can reset the cart to $0.00, so
+      // select the pair together and retry the whole selection if it goes stale.
+      let cartReady = false;
+      for (let attempt = 1; attempt <= 3 && !cartReady; attempt += 1) {
+        await selectPlan(page, payload.plan.name);
+        await settlePopups(page);
+
+        if (payload.addOns.router.enabled) {
+          await selectRouter(page, payload.addOns.router.model || "BYO Modem");
+        }
+
+        try {
+          await waitForPlanInCart(page, payload.plan.name, 6_000);
+          await assertNbnPlanInCart(page, payload.plan.name);
+          cartReady = true;
+        } catch (error) {
+          log(7, `Cart not ready after plan/router (attempt ${attempt})`, {
+            error: String(error),
+          });
+        }
+      }
+
+      if (!cartReady) {
+        throw new Error(
+          "Sticky cart did not retain the NBN plan after selecting the router",
+        );
+      }
+
+      done(5);
+      done(6);
+      if (payload.addOns.router.enabled) {
+        done(7);
+      }
+
+      await assertNbnPlanInCart(page, payload.plan.name);
+      done(8);
+
+      await clickOrderNow(page);
+
+      const popupId = await activePopupId(page);
+      const onCheckout = /checkout|login/i.test(page.url());
+      log(9, "Order Now clicked", { url: page.url(), popupId, onCheckout });
+      return onCheckout;
+    };
+
+    // Headed runs occasionally bounce from /checkout back to the home page, or
+    // fail to navigate at all, when the server session commits late or the BYO
+    // modem add-to-cart poisons the cart. Start a clean session and rebuild the
+    // order, retrying a few times before giving up.
+    let atCheckout = false;
+    for (let attempt = 1; attempt <= 5 && !atCheckout; attempt += 1) {
+      if (attempt > 1) {
+        await resetSession();
+        await page.goto(payload.portal.url, {
+          waitUntil: "domcontentloaded",
+          timeout: 60_000,
+        });
+        await page.waitForTimeout(4000);
+      }
+
+      atCheckout = await selectAndOrder();
+
+      if (!atCheckout) {
+        log(9, `Checkout bounce on attempt ${attempt}; retrying`, {
+          url: page.url(),
+        });
+      }
+    }
+
+    if (!atCheckout) {
+      throw new Error("Order Now did not reach checkout after retries");
     }
 
     done(9);
     done(10);
 
     const email = page
-      .getByLabel(/email/i)
-      .first()
-      .or(page.locator('input[type="email"]').first());
-    await email.fill(payload.customer.email);
+      .locator('#email, input[type="email"], input[name*="email" i]')
+      .filter({ visible: true })
+      .first();
+    if (!(await email.count())) {
+      throw new Escalation("Checkout email field not found");
+    }
+    await fillVerified(page, email, payload.customer.email);
 
-    const emailNext = await findAction(page, {
-      step: 11,
-      intent: "Continue after entering checkout email",
-      names: ["Next", "Continue"],
-      modelBudget,
-      heals,
-    });
+    const emailNext = page
+      .locator("button, a, input[type='submit'], input[type='button']")
+      .filter({ hasText: /next/i })
+      .filter({ visible: true })
+      .first();
+    if (!(await emailNext.count())) {
+      throw new Escalation("Checkout Next control not found");
+    }
     await clickAction(emailNext);
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(1500);
 
-    if (await page.getByText(/verification code|one.time|otp/i).count()) {
+    const otpField = page.locator(
+      'input[autocomplete="one-time-code"], input[name*="otp" i], input[id*="otp" i], input[name*="verification" i]',
+    );
+    if (await otpField.count()) {
       throw new Escalation("Email OTP requires human submission");
     }
 
@@ -257,6 +325,11 @@ export async function runAgent({
 
     done(15);
 
+    const beforeSummary = await page.evaluate(() => ({
+      url: location.href,
+      body: document.body.innerText.replace(/\s+/g, " ").slice(0, 400),
+    }));
+    log(15, "Before order summary", beforeSummary);
     await verifyOrderSummary(page, payload);
     const payResult = await executePayment(page, {
       jobId,
@@ -327,11 +400,21 @@ export async function runAgent({
     return report;
   } catch (error) {
     const escalated = error instanceof Escalation;
+    const reason = error instanceof Error ? error.message : String(error);
     const report = makeReport(
       escalated ? "escalated" : "failed",
       undefined,
-      error instanceof Error ? error.message : String(error),
+      reason,
     );
+
+    try {
+      await page.screenshot({
+        path: path.join(evidenceDir, "failure.png"),
+        fullPage: true,
+      });
+    } catch {
+      // Page may already be closed.
+    }
 
     await writeReport(report);
     await leakScan(evidenceDir);
