@@ -1,8 +1,8 @@
 import type { Page } from "playwright";
 
 import { resolveCard } from "./vault";
+import { isApprovedPortalHost } from "./portal-config";
 
-const APPROVED = ["test-tangerine.hipeely.com"];
 const TILL_ORIGINS = (process.env.APPROVED_TILL_ORIGINS || "")
   .split(",")
   .map((value) => value.trim())
@@ -14,7 +14,7 @@ export async function executePayment(
 ) {
   const host = new URL(page.url()).hostname;
 
-  if (!APPROVED.includes(host)) {
+  if (!isApprovedPortalHost(host)) {
     throw new Error(`Unapproved portal origin: ${host}`);
   }
 

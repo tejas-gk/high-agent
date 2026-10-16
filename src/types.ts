@@ -81,6 +81,16 @@ export type RunReport = {
   modelCalls: number;
   failureReason?: string;
   evidenceDir: string;
+  budget?: {
+    modelCalls: number;
+    maxModelCalls: number;
+    estimatedModelCostUsd: number;
+    maxModelCostUsd: number;
+    heals: number;
+    maxHeals: number;
+    maxRetriesPerStep: number;
+    maxRuntimeMs: number;
+  };
 };
 export type JobView = {
   id: string;

@@ -3,6 +3,15 @@ import { chooseCandidate, planPayloadForm, type PayloadFieldKey } from "./ai";
 import { observe, type Candidate } from "./observe";
 import type { HealEvent } from "./types";
 import type { JobPayload } from "./payload";
+import { detectJourneyState } from "./journey-state";
+
+type ModelBudget = { used: number; max: number; estimatedCostUsd: number; maxCostUsd: number; costPerCallUsd: number };
+function claimModelCall(budget: ModelBudget) {
+  if (budget.used >= budget.max) throw new Error("Model-call budget exhausted");
+  if (budget.estimatedCostUsd + budget.costPerCallUsd > budget.maxCostUsd) throw new Error("Model-cost budget exhausted");
+  budget.used += 1;
+  budget.estimatedCostUsd += budget.costPerCallUsd;
+}
 
 // Resolve via the stable data-ai-id stamped at observe() time. This fixes
 // the mis-click/mis-fill bug where healing used nth(id-1) over a freshly
@@ -96,23 +105,26 @@ async function fillControl(page: Page, candidate: Candidate, value: string): Pro
   return last.trim() === value.trim();
 }
 
-export async function semanticLocator(page: Page, args: { step: number; intent: string; names: string[]; guarded?: boolean; modelBudget: { used: number; max: number } }): Promise<{ locator: Locator; heal?: HealEvent }> {
+export async function semanticLocator(page: Page, args: { step: number; intent: string; names: string[]; guarded?: boolean; modelBudget: ModelBudget }): Promise<{ locator: Locator; heal?: HealEvent }> {
   if (args.guarded) throw new Error("Guarded step cannot use free-form healing");
-  // Treat "Proceed" as the renamed Continue/Next so mutated UI still matches
-  // without spending a model call.
   const names = args.names.flatMap((n) => (/^(next|continue)$/i.test(n.trim()) ? [n, "Proceed"] : [n]));
-  for (const n of names) {
-    const byText = page.locator("button, a, [role='button'], input[type='submit'], input[type='button']").filter({ hasText: new RegExp(escapeRx(n), "i") });
-    for (let index = 0; index < (await byText.count()); index += 1) {
-      const candidate = byText.nth(index);
-      if (await candidate.isVisible().catch(() => false)) return { locator: candidate, heal: { step: args.step, level: "L1", intent: args.intent, reason: "Recovered by visible action text", newLocator: `button|a text~${n}`, evidence: "Visible action text matched intent", verified: false } };
-    }
-    const visibleText = page.getByText(new RegExp(escapeRx(n), "i")).first();
-    if (await visibleText.count()) return { locator: visibleText, heal: { step: args.step, level: "L1", intent: args.intent, reason: "Recovered by visible text", newLocator: `text~${n}`, evidence: "Visible text matched intent", verified: false } };
-  }
-  if (args.modelBudget.used >= args.modelBudget.max) throw new Error("Model-call budget exhausted");
   const o = await observe(page);
-  args.modelBudget.used++;
+  for (const n of names) {
+    const rx = new RegExp(escapeRx(n), "i");
+    const role = page.getByRole("button", { name: rx }).first();
+    if (await role.count() && await role.isVisible().catch(() => false)) return { locator: role, heal: { step: args.step, level: "L1", intent: args.intent, reason: "Recovered by accessible role/name", newLocator: `role=button name~${n}`, evidence: "Accessible name matched intent", verified: false } };
+    const label = page.getByLabel(rx).first();
+    if (await label.count() && await label.isVisible().catch(() => false)) return { locator: label, heal: { step: args.step, level: "L1", intent: args.intent, reason: "Recovered by label", newLocator: `label~${n}`, evidence: "Label matched intent", verified: false } };
+    const test = o.candidates.find((c) => c.testId && rx.test(c.testId));
+    if (test) return { locator: locatorFor(page, test), heal: { step: args.step, level: "L1", intent: args.intent, reason: "Recovered by test id", newLocator: `testid=${test.testId}`, evidence: test.fingerprint || "test id", verified: false } };
+    const byText = page.locator("button, a, [role='button'], input[type='submit'], input[type='button']").filter({ hasText: rx }).first();
+    if (await byText.count() && await byText.isVisible().catch(() => false)) return { locator: byText, heal: { step: args.step, level: "L1", intent: args.intent, reason: "Recovered by visible text", newLocator: `text~${n}`, evidence: "Visible text matched intent", verified: false } };
+    const landmark = o.candidates.find((c) => rx.test(`${c.landmark || ""} ${c.label} ${c.name} ${c.text}`));
+    if (landmark) return { locator: locatorFor(page, landmark), heal: { step: args.step, level: "L1", intent: args.intent, reason: "Recovered by nearby landmark", newLocator: `landmark~${landmark.landmark || n}`, evidence: landmark.fingerprint || "landmark", verified: false } };
+    const fingerprint = o.candidates.find((c) => rx.test(c.fingerprint || ""));
+    if (fingerprint) return { locator: locatorFor(page, fingerprint), heal: { step: args.step, level: "L1", intent: args.intent, reason: "Recovered by DOM fingerprint", newLocator: `fingerprint:${fingerprint.fingerprint}`, evidence: fingerprint.fingerprint || "", verified: false } };
+  }
+  claimModelCall(args.modelBudget);
   const choice = await chooseCandidate({ intent: args.intent, observation: o, candidates: o.candidates });
   if (!choice || choice.confidence < 0.7) throw new Error("No high-confidence semantic recovery");
   const c = o.candidates.find((x) => x.id === choice.candidateId);
@@ -120,7 +132,7 @@ export async function semanticLocator(page: Page, args: { step: number; intent: 
   return { locator: locatorFor(page, c), heal: { step: args.step, level: "L2", intent: args.intent, reason: choice.reason, newLocator: `candidate:${choice.candidateId}`, confidence: choice.confidence, evidence: JSON.stringify(c), verified: false } };
 }
 
-export async function recoverUnexpectedPage(page: Page, args: { step: number; goal: string; expected?: string; payload: JobPayload; modelBudget: { used: number; max: number }; heals: HealEvent[] }): Promise<boolean> {
+export async function recoverUnexpectedPage(page: Page, args: { step: number; goal: string; expected?: string; payload: JobPayload; modelBudget: ModelBudget; heals: HealEvent[] }): Promise<boolean> {
   if (args.expected && (await page.locator(args.expected).filter({ visible: true }).count())) return true;
   const observation = await observe(page);
   const pageText = `${observation.title} ${observation.headings.join(" ")} ${observation.bodyText}`;
@@ -128,8 +140,6 @@ export async function recoverUnexpectedPage(page: Page, args: { step: number; go
   if (/verify you are human|i am not a robot|captcha challenge/i.test(pageText) || captchaChallengeFrame) throw new Error("HUMAN_REQUIRED:CAPTCHA");
   if (/one[- ]time|verification code|enter.*otp|email.*code/i.test(pageText)) throw new Error("HUMAN_REQUIRED:EMAIL_OTP");
   if (/card number|cvv|pay now|payment details/i.test(pageText)) throw new Error("Guarded payment state encountered during free-form recovery");
-  if (args.modelBudget.used >= args.modelBudget.max) throw new Error("Model-call budget exhausted");
-
   const visibleInputs = observation.candidates.filter((candidate) => ["input", "select", "textarea"].includes(candidate.tag) && candidate.type !== "hidden" && !candidate.disabled);
   const safeActions = observation.candidates.filter((candidate) =>
     !candidate.disabled &&
@@ -169,7 +179,7 @@ export async function recoverUnexpectedPage(page: Page, args: { step: number; go
   // spent a second call on chooseCandidate even when the form plan already
   // contained an action — doubling token/request cost per recovery.
   if (visibleInputs.length) {
-    args.modelBudget.used++;
+    claimModelCall(args.modelBudget);
     const plan = await planPayloadForm({ goal: args.goal, observation, candidates: [...visibleInputs, ...safeActions] });
     if (plan && plan.confidence >= 0.6) {
       let filled = 0;
@@ -184,14 +194,15 @@ export async function recoverUnexpectedPage(page: Page, args: { step: number; go
       if (plan.actionCandidateId) {
         const action = observation.candidates.find((x) => x.id === plan.actionCandidateId);
         if (action && safeActions.some((x) => x.id === action.id)) {
-          const before = `${page.url()}|${observation.headings.join("|")}|${observation.bodyText.slice(0, 300)}`;
+          const beforeState = await detectJourneyState(page);
           await clickStable(page, action);
           await page.waitForTimeout(800);
-          const afterObservation = await observe(page);
+          const afterState = await detectJourneyState(page);
           const reachedExpected = args.expected ? (await page.locator(args.expected).filter({ visible: true }).count()) > 0 : false;
-          const changed = before !== `${page.url()}|${afterObservation.headings.join("|")}|${afterObservation.bodyText.slice(0, 300)}`;
-          args.heals.push({ step: args.step, level: "L3", intent: args.goal, reason: plan.reason, newLocator: `form-plan/action:${action.id}`, confidence: plan.confidence, evidence: `Mapped ${filled}/${plan.assignments.length} payload-backed field(s); action=${action.text || action.name || action.label}`, verified: reachedExpected || changed });
-          if (reachedExpected || changed) return true;
+          const actionGone = (await locatorFor(page, action).count().catch(() => 0)) === 0;
+          const verified = reachedExpected || afterState.stage !== beforeState.stage || (actionGone && afterState.signature !== beforeState.signature);
+          args.heals.push({ step: args.step, level: "L3", intent: args.goal, reason: plan.reason, newLocator: `form-plan/action:${action.id}`, confidence: plan.confidence, evidence: `Mapped ${filled}/${plan.assignments.length} payload-backed field(s); ${beforeState.stage}->${afterState.stage}; action=${action.text || action.name || action.label}`, verified });
+          if (verified) return true;
           // Fills stuck but nav happened — report progress so the caller can
           // re-verify instead of spending another model call immediately.
           if (filled > 0) return true;
@@ -204,8 +215,7 @@ export async function recoverUnexpectedPage(page: Page, args: { step: number; go
   }
 
   if (safeActions.length) {
-    if (args.modelBudget.used >= args.modelBudget.max) throw new Error("Model-call budget exhausted");
-    args.modelBudget.used++;
+    claimModelCall(args.modelBudget);
     const choice = await chooseCandidate({
       intent: `${args.goal}. The current page may have changed structure, tags, ids, classes, labels, layout or step order. Choose only a safe navigation/dismiss action that advances the existing payload-backed journey. Do not invent a value or accept a new preference.`,
       observation,
@@ -214,15 +224,15 @@ export async function recoverUnexpectedPage(page: Page, args: { step: number; go
     if (choice && choice.confidence >= 0.7) {
       const selected = safeActions.find((candidate) => candidate.id === choice.candidateId);
       if (selected) {
-        const before = `${page.url()}|${observation.headings.join("|")}|${observation.bodyText.slice(0, 300)}`;
+        const beforeState = await detectJourneyState(page);
         await clickStable(page, selected);
         await page.waitForTimeout(700);
-        const afterObservation = await observe(page);
-        const after = `${page.url()}|${afterObservation.headings.join("|")}|${afterObservation.bodyText.slice(0, 300)}`;
+        const afterState = await detectJourneyState(page);
         const reachedExpected = args.expected ? (await page.locator(args.expected).filter({ visible: true }).count()) > 0 : false;
-        const changed = before !== after;
-        args.heals.push({ step: args.step, level: "L3", intent: args.goal, reason: choice.reason, newLocator: `candidate:${choice.candidateId}`, confidence: choice.confidence, evidence: JSON.stringify(selected), verified: reachedExpected || changed });
-        if (reachedExpected || changed) return true;
+        const actionGone = (await locatorFor(page, selected).count().catch(() => 0)) === 0;
+        const verified = reachedExpected || afterState.stage !== beforeState.stage || (actionGone && afterState.signature !== beforeState.signature);
+        args.heals.push({ step: args.step, level: "L3", intent: args.goal, reason: choice.reason, newLocator: `candidate:${choice.candidateId}`, confidence: choice.confidence, evidence: `${beforeState.stage}->${afterState.stage}; ${JSON.stringify(selected)}`, verified });
+        if (verified) return true;
       }
     }
   }

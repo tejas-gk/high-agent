@@ -62,7 +62,19 @@ function pageContext(o: Observation, maxBody = 500): string {
   if (o.title) bits.push(`T:${o.title.slice(0, 80)}`);
   if (o.headings.length) bits.push(`H:${o.headings.slice(0, 5).join(" / ").slice(0, 200)}`);
   if (o.bodyText) bits.push(`B:${o.bodyText.slice(0, maxBody)}`);
+  if (o.accessibilityTree) bits.push(`A11Y:${o.accessibilityTree.slice(0, 1800)}`);
   return bits.join(" ");
+}
+
+type ChatContent = string | Array<{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }>;
+type ChatMessage = { role: "system" | "user"; content: ChatContent };
+
+function groundedUser(text: string, observation: Observation): ChatContent {
+  if (!observation.screenshotDataUrl) return text;
+  return [
+    { type: "text", text },
+    { type: "image_url", image_url: { url: observation.screenshotDataUrl } },
+  ];
 }
 
 // Tiny in-memory cache: identical (goal + page signature + candidates) reuses
@@ -73,7 +85,7 @@ function cacheKey(kind: string, goal: string, o: Observation, candidates: Candid
   return `${kind}|${goal.slice(0, 120)}|${o.url}|${o.headings.join("|").slice(0, 160)}|${o.bodyText.slice(0, 300)}|${candidates.map((c) => `${c.id}:${c.text}|${c.label}|${c.name}|${c.placeholder}|${c.type}`).join(";").slice(0, 1200)}`;
 }
 
-async function chatJson(messages: Array<{ role: "system" | "user"; content: string }>, cacheHitKey?: string) {
+async function chatJson(messages: ChatMessage[], cacheHitKey?: string) {
   const config = aiConfig();
   if (!config) return null;
   if (cacheHitKey && cache.has(cacheHitKey)) return cache.get(cacheHitKey)!;
@@ -117,13 +129,13 @@ export async function chooseCandidate(args: {
       { role: "system", content: "Pick one visible browser control by id. JSON only." },
       {
         role: "user",
-        content: [
+        content: groundedUser([
           `Goal:${args.intent.slice(0, 200)}`,
           `Page:${pageContext(args.observation)}`,
           `C:${compactCandidates(usable)}`,
           `Note:"Proceed" means Next/Continue (renamed by layout). Never pay/OTP/captcha/donate/consent.`,
           `JSON:{"candidateId":n,"confidence":0..1,"reason":"<8 words"}`,
-        ].join(" "),
+        ].join(" "), args.observation),
       },
     ],
     key,
@@ -198,14 +210,14 @@ export async function planPayloadForm(args: {
       },
       {
         role: "user",
-        content: [
-          `Goal:${args.goal.slice(0, 200)}`,
+        content: groundedUser([
+          `Overall journey goal: complete the NBN signup safely. Current recovery goal:${args.goal.slice(0, 200)}`,
           `Page:${pageContext(args.observation)}`,
           `Keys:${ALLOWED_KEYS.join(",")}`,
           `C:${compactCandidates(usable)}`,
-          `Rules: map confident fields only; skip filled (=value) unless wrong; one nav Next/Continue/Proceed after fill; never Pay/OTP/captcha/donate/consent.`,
+          `Rules: reason from the CURRENT page, not a fixed step number. Map confident fields only; skip filled (=value) unless wrong; choose one safe navigation action after fill; never Pay/OTP/captcha/donate/consent and never invent a value.`,
           `JSON:{"assignments":[{"candidateId":1,"valueKey":"customer.firstName"}],"actionCandidateId":10,"confidence":0.0,"reason":"<8 words"}`,
-        ].join(" "),
+        ].join(" "), args.observation),
       },
     ],
     key,

@@ -2,6 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright";
 import { recoverUnexpectedPage } from "./healing";
+import { detectJourneyState } from "./journey-state";
+import { isApprovedPortalUrl } from "./portal-config";
 import { executePayment } from "./payment";
 import { installMutationLayer } from "./mutation";
 import { leakScan } from "./security";
@@ -40,7 +42,21 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
   const started = Date.now();
   const completed: number[] = [];
   const heals: HealEvent[] = [];
-  const modelBudget = { used: 0, max: 10 };
+  const maxRuntimeMs = Number(process.env.AGENT_MAX_RUNTIME_MS || 360_000);
+  const maxHeals = Number(process.env.AGENT_MAX_HEALS || 12);
+  const maxRetriesPerStep = Number(process.env.AGENT_MAX_RETRIES_PER_STEP || 3);
+  const modelBudget = {
+    used: 0,
+    max: Number(process.env.AGENT_MAX_MODEL_CALLS || 10),
+    estimatedCostUsd: 0,
+    maxCostUsd: Number(process.env.AGENT_MAX_MODEL_COST_USD || 0.50),
+    costPerCallUsd: Number(process.env.AI_ESTIMATED_COST_PER_CALL_USD || 0.01),
+  };
+  const ensureBudget = () => {
+    if (Date.now() - started > maxRuntimeMs) throw new Escalation("Overall run time budget exhausted");
+    if (heals.length > maxHeals) throw new Escalation("Healing-event budget exhausted");
+    if (modelBudget.used > modelBudget.max || modelBudget.estimatedCostUsd > modelBudget.maxCostUsd) throw new Escalation("Model budget exhausted");
+  };
   const evidenceDir = path.resolve("artifacts", jobId);
   const previewPath = path.join(evidenceDir, "live.png");
   let sensitiveMode = false;
@@ -73,6 +89,7 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
     jobId, status, transactionId, completedSteps: completed, completedStepDetails: describeCompletedSteps(completed), heals,
     startedAt: new Date(started).toISOString(), finishedAt: new Date().toISOString(),
     durationMs: Date.now() - started, modelCalls: modelBudget.used, failureReason, evidenceDir,
+    budget: { modelCalls: modelBudget.used, maxModelCalls: modelBudget.max, estimatedModelCostUsd: Number(modelBudget.estimatedCostUsd.toFixed(4)), maxModelCostUsd: modelBudget.maxCostUsd, heals: heals.length, maxHeals, maxRetriesPerStep, maxRuntimeMs },
   });
   const writeReport = (report: RunReport) => fs.writeFile(path.join(evidenceDir, "report.json"), JSON.stringify(report, null, 2));
   const bodyText = async () => (await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " ");
@@ -88,25 +105,7 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
   // "Build your plan", "Check your address" and a "First name" newsletter
   // field that match the old text-only rules on EVERY page — which caused the
   // runner to think the address step was already done and skip it.
-  const detectJourneyStep = async (): Promise<number> => {
-    const text = (await bodyText()).toUpperCase();
-    const url = page.url();
-
-    if (/TRANSACTION\s*(?:ID|NUMBER)|ORDER\s*(?:CONFIRMED|NUMBER)|THANK YOU.*ORDER/i.test(text)) return 20;
-    if (/3.?D SECURE|AUTHENTICATED.*ECI\s*05/i.test(text)) return 18;
-
-    if ((await visibleCount('#card_number, input[autocomplete="cc-number"], input[name*="cardnumber" i]')) > 0 ||
-      /LASTLY,?\s*WE JUST NEED TO TAKE YOUR PAYMENT|NAME ON CARD|PAYMENT DETAILS/i.test(text)) return 16;
-    if ((await visibleCount('input[name*="donation" i]')) > 0 || /SMALL CHANGE BIG CHANGE|WOULD YOU LIKE TO (?:ADD|MAKE).*DONATION/i.test(text)) return 15;
-    if ((await visibleCount('input[name="new_or_transfer"], input[name*="avc" i], select[name*="provider" i]')) > 0 ||
-      /PROCESS ORDER(?: AND)? PAY|CURRENT PROVIDER/i.test(text)) return 14;
-    if ((await visibleCount('#self_care_portal, input[name*="self_care" i]')) > 0 || /SELF CARE PORTAL|SERVICE ADDRESS|DELIVERY ADDRESS/i.test(text)) return 13;
-    if ((await visibleCount('#fname, #salutation, #dob')) > 0 || (/CONTACT DETAILS/i.test(text) && !/ID VERIFICATION|LICEN[CS]E NUMBER/i.test(text))) return 12;
-    if (/checkout\/login/i.test(url)) return 11;
-    if (/#order-speeds/i.test(url)) return 5;
-    if ((await visibleCount('#autocomplete, #autocomplete-stickysearch')) > 0) return 2;
-    return 0;
-  };
+  const detectJourneyStep = async (): Promise<number> => (await detectJourneyState(page)).step;
 
   // Reconciliation against the live page is ONLY valid after a human paused
   // and manually navigated the shared browser. On a normal run the steps must
@@ -187,14 +186,17 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
       if (await checkpointAndMaybeSkip(args.step)) return;
       await bailIfNeeded();
       cycle += 1;
-      const semanticAttempts = args.attempts ?? 2;
+      ensureBudget();
+      if (cycle > maxRetriesPerStep) throw new Escalation(`Retry budget exhausted for step ${args.step}`);
+      const semanticAttempts = Math.min(args.attempts ?? 2, maxRetriesPerStep);
       for (let attempt = 1; attempt <= semanticAttempts && !(await args.verified()); attempt += 1) {
         if (modelBudget.used >= modelBudget.max) {
           reason = "Model-call budget exhausted; human completion required";
           break;
         }
         try {
-          const recovered = await recoverUnexpectedPage(page, { step: args.step, goal: args.goal, payload, modelBudget, heals });
+          const recovered = await recoverUnexpectedPage(page, { step: args.step, goal: `Overall goal: safely complete the NBN signup and obtain a transaction ID. Current milestone: ${args.goal}`, payload, modelBudget, heals });
+          ensureBudget();
           await page.waitForTimeout(500);
           if (recovered && await args.verified()) {
             log(args.step, "Semantic recovery succeeded and postcondition verified", { cycle, attempt });
@@ -270,7 +272,7 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
 
   try {
     await page.goto(payload.portal.url, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    if (!page.url().includes("test-tangerine.hipeely.com")) throw new Error("Portal URL did not match approved test environment");
+    if (!isApprovedPortalUrl(page.url())) throw new Error("Portal URL did not match the configured approved test environment");
     done(1); log(1, "Portal opened and approved origin verified");
 
     const selectAndOrder = async (): Promise<boolean> => {
@@ -390,14 +392,53 @@ export async function runAgent({ jobId, payload, mutate, emit, checkpoint, reque
       }
       done(11); log(11, "Email verification stage completed");
 
-      await runRecoverable({ step: 12, goal: "Complete contact details using only payload-backed customer values and advance", deterministic: () => fillContactAndAdvance(page, payload), verified: async () => /service address|delivery address|self care portal|connection details|new connection|transfer connection/i.test(await bodyText()), attempts: 3 });
-      done(12); log(12, "Contact details completed and next state verified");
-      await runRecoverable({ step: 13, goal: "Complete service and delivery address using only the supplied payload address and advance", deterministic: () => fillService(page, payload), verified: async () => /current provider|avc|new connection|transfer connection|process order|donation|small change big change/i.test(await bodyText()), attempts: 3 });
-      done(13); log(13, "Service/delivery details completed and next state verified");
-      await runRecoverable({ step: 14, goal: "Complete connection activation/transfer/provider/date choices and Process Order and Pay", deterministic: () => fillConnection(page, payload), verified: async () => /donation|small change big change|name on card|payment details|card number|pay now/i.test(await bodyText()), attempts: 3 });
-      done(14); log(14, "Connection details completed and next state verified");
-      await runRecoverable({ step: 15, goal: "Decline the optional donation and advance to payment/order summary", deterministic: () => declineDonationAndAdvance(page), verified: async () => /name on card|payment details|card number|pay now|order summary/i.test(await bodyText()), attempts: 2 });
-      done(15); log(15, "Donation declined; payment/order-summary state verified");
+      // Goal-state scheduler: the portal may reorder checkout pages. We inspect
+      // the page we actually have and dispatch the matching safe capability
+      // instead of assuming 12 -> 13 -> 14 -> 15.
+      let checkoutTransitions = 0;
+      while (checkoutTransitions++ < 14) {
+        ensureBudget();
+        const state = await detectJourneyState(page);
+        if (state.step >= 16) break;
+
+        if (state.step === 12) {
+          await runRecoverable({ step: 12, goal: "Complete contact details using only payload-backed customer values and advance", deterministic: () => fillContactAndAdvance(page, payload), verified: async () => (await detectJourneyState(page)).stage !== "contact", attempts: 3 });
+          done(12); log(12, "Contact details completed and independently verified");
+          continue;
+        }
+        if (state.step === 13) {
+          await runRecoverable({ step: 13, goal: "Complete service and delivery address using only the supplied payload address and advance", deterministic: () => fillService(page, payload), verified: async () => (await detectJourneyState(page)).stage !== "service-address", attempts: 3 });
+          done(13); log(13, "Service/delivery details completed and independently verified");
+          continue;
+        }
+        if (state.step === 14) {
+          await runRecoverable({ step: 14, goal: "Complete connection activation/transfer/provider/date choices and advance", deterministic: () => fillConnection(page, payload), verified: async () => (await detectJourneyState(page)).stage !== "connection", attempts: 3 });
+          done(14); log(14, "Connection details completed and independently verified");
+          continue;
+        }
+        if (state.step === 15) {
+          await runRecoverable({ step: 15, goal: "Decline the optional donation and advance", deterministic: () => declineDonationAndAdvance(page), verified: async () => (await detectJourneyState(page)).stage !== "donation", attempts: 2 });
+          done(15); log(15, "Donation declined and independently verified");
+          continue;
+        }
+
+        // Unknown/reordered/new mandatory page: L3 reasons from the overall
+        // journey goal and may fill only values that already exist in payload.
+        const before = state.signature;
+        const recovered = await recoverUnexpectedPage(page, {
+          step: state.step || 12,
+          goal: "Complete the remaining NBN checkout from the current page. Handle reordered pages or new payload-answerable fields, and advance toward payment without inventing any customer preference.",
+          payload, modelBudget, heals,
+        });
+        ensureBudget();
+        const after = await detectJourneyState(page);
+        if (!recovered || after.signature === before) {
+          throw new Escalation("L3 could not safely re-plan the changed checkout flow");
+        }
+        log(state.step || 12, "L3 re-planned from current journey state", { from: state.stage, to: after.stage });
+      }
+      const checkoutState = await detectJourneyState(page);
+      if (checkoutState.step < 16) throw new Escalation("Checkout goal-state scheduler exhausted before payment");
 
       // Pause/resume is allowed across normal checkout pages. If the human
       // advanced beyond Pay Now while paused, never submit payment a second time.
