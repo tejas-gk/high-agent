@@ -63,6 +63,9 @@ export async function recoverUnexpectedPage(page: Page, args: { step: number; go
       "connection.avcId": p.connectionDetails.avcId,
       "connection.moveInDate": p.connectionDetails.moveInDate,
       "connection.deliveryDate": p.connectionDeliveryDate,
+      "connection.activation": p.connectionDetails.moveInDate ? "New" : "Transfer",
+      "policy.unsure": "Unsure",
+      "policy.otherProvider": "Other",
     };
     return map[key] ?? "";
   };
@@ -82,6 +85,8 @@ export async function recoverUnexpectedPage(page: Page, args: { step: number; go
           const exact = options.find((x) => x.trim().toLowerCase() === value.trim().toLowerCase());
           const partial = exact ?? options.find((x) => x.toLowerCase().includes(value.toLowerCase()));
           if (partial) await control.selectOption({ label: partial }).catch(() => undefined);
+        } else if (/radio|checkbox/i.test(candidate.type) || candidate.role === "radio" || candidate.role === "checkbox") {
+          await control.check({ force: true }).catch(() => undefined);
         } else {
           await control.fill(value).catch(() => undefined);
           const persisted = await control.inputValue().catch(() => "");
