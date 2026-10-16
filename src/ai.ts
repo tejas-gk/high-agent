@@ -55,7 +55,8 @@ export async function chooseCandidate(args: {
   });
 
   if (!response.ok) {
-    throw new Error(`AI grounding failed (${response.status})`);
+    const safe = (await response.text().catch(() => "")).replace(/[A-Za-z0-9_-]{24,}/g, "[redacted]").slice(0, 240);
+    throw new Error(`AI grounding failed (${response.status})${safe ? `: ${safe}` : ""}`);
   }
 
   const data = (await response.json()) as {
